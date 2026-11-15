@@ -131,6 +131,15 @@ async function migrate() {
     ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS allow_card boolean NOT NULL DEFAULT true;
     ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS allow_mobile_money boolean NOT NULL DEFAULT true;
     CREATE INDEX IF NOT EXISTS orders_user_idx ON orders(user_id, created_at DESC);
+
+    -- Sécurité Supabase : l'application ne parle jamais directement à la base (uniquement ce serveur).
+    -- RLS activé sans règle = l'API publique de Supabase ne peut rien lire ni écrire dans ces tables.
+    ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE otp_codes ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE shop_settings ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
   `);
 }
 
