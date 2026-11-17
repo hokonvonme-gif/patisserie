@@ -12,6 +12,7 @@ const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const multer = require('multer');
+const Redis = require('ioredis');
 const { Pool } = require('pg');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -35,6 +36,43 @@ const pool = new Pool({
 });
 const q = (text, params) => pool.query(text, params);
 
+// ── Redis (Upstash) : cache du catalogue, positions des livreurs, météo. Repli en mémoire si indisponible.
+let redis = null;
+if (env.REDIS_URL) {
+  redis = new Redis(env.REDIS_URL, { maxRetriesPerRequest: 2, enableOfflineQueue: false });
+  redis.on('error', (e) => console.error('[Redis]', e.message));
+}
+const memKv = new Map();
+const redisReady = () => redis && redis.status === 'ready';
+async function kvGet(key) {
+  try {
+    if (redisReady()) {
+      const v = await redis.get(key);
+      return v ? JSON.parse(v) : null;
+    }
+  } catch (_) { /* repli mémoire */ }
+  const m = memKv.get(key);
+  return m && m.exp > Date.now() ? m.value : null;
+}
+async function kvSet(key, value, ttlSec) {
+  try {
+    if (redisReady()) { await redis.set(key, JSON.stringify(value), 'EX', ttlSec); return; }
+  } catch (_) { /* repli mémoire */ }
+  memKv.set(key, { value, exp: Date.now() + ttlSec * 1000 });
+}
+async function kvDel(...keys) {
+  keys.forEach((k) => memKv.delete(k));
+  try { if (redisReady() && keys.length) await redis.del(...keys); } catch (_) { /* ignoré */ }
+}
+async function cached(key, ttl, fn) {
+  const hit = await kvGet(key);
+  if (hit) return hit;
+  const val = await fn();
+  await kvSet(key, val, ttl);
+  return val;
+}
+const bustCatalog = () => kvDel('c:categories', 'c:products', 'c:settings');
+
 // ── Utilitaires ──────────────────────────────────────────────────────────────
 const httpErr = (status, message) => Object.assign(new Error(message), { status });
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -46,6 +84,46 @@ const int = (v, d = 0) => {
 };
 const bool = (v, d = false) => (v === true || v === 'true' || v === '1' ? true : v === false || v === 'false' || v === '0' ? false : d);
 const hashOtp = (code) => crypto.createHash('sha256').update(`${code}:${JWT_SECRET}`).digest('hex');
+
+const LANGS = ['fr', 'en', 'es', 'pt', 'ar', 'zh', 'ee', 'ha', 'yo', 'kab'];
+const CURRENCIES = ['XOF', 'USD', 'EUR', 'GBP'];
+const num2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
+/** Convertit un prix (dans la devise du produit) en FCFA selon les taux de la propriétaire. */
+function toXof(amount, cur, s) {
+  const rate = cur === 'USD' ? Number(s.rate_usd) : cur === 'EUR' ? Number(s.rate_eur) : cur === 'GBP' ? Number(s.rate_gbp) : 1;
+  return Math.round((Number(amount) || 0) * (rate || 1));
+}
+const rad = (d) => (d * Math.PI) / 180;
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const a = Math.sin(rad(lat2 - lat1) / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lng2 - lng1) / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+const OSRM = (env.OSRM_BASE || 'https://router.project-osrm.org').replace(/\/$/, '');
+/** Distance et durée par la route (OSRM) ; repli : distance à vol d'oiseau × 1,25. */
+async function roadRoute(lat1, lng1, lat2, lng2) {
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 6000);
+    const r = await fetch(`${OSRM}/route/v1/driving/${lng1},${lat1};${lng2},${lat2}?overview=false`, { signal: ctl.signal });
+    clearTimeout(t);
+    const j = await r.json();
+    const rt = j.routes && j.routes[0];
+    if (rt) return { km: rt.distance / 1000, min: rt.duration / 60 };
+  } catch (_) { /* repli */ }
+  const km = haversineKm(lat1, lng1, lat2, lng2) * 1.25;
+  return { km, min: (km / 30) * 60 };
+}
+async function deliveryInfo(settings, lat, lng) {
+  let km = null;
+  let min = null;
+  if (settings.shop_lat != null && settings.shop_lng != null) {
+    const r = await roadRoute(settings.shop_lat, settings.shop_lng, lat, lng);
+    km = Math.round(r.km * 100) / 100;
+    min = Math.round(r.min);
+  }
+  const raw = (settings.delivery_fee || 0) + (km != null ? km * (settings.delivery_per_km || 0) : 0);
+  return { km, min, fee: Math.round(raw / 5) * 5 };
+}
 
 const STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'out_for_delivery', 'completed', 'cancelled', 'quote_pending', 'quoted'];
 
@@ -127,6 +205,39 @@ async function migrate() {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_provider text NOT NULL DEFAULT '';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS lang text NOT NULL DEFAULT 'fr';
+    ALTER TABLE categories ADD COLUMN IF NOT EXISTS image_url text;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS currency text NOT NULL DEFAULT 'XOF';
+    ALTER TABLE products ALTER COLUMN price TYPE double precision;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS rate_usd double precision NOT NULL DEFAULT 600;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS rate_eur double precision NOT NULL DEFAULT 655.957;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS rate_gbp double precision NOT NULL DEFAULT 770;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS shop_lat double precision;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS shop_lng double precision;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS delivery_per_km int NOT NULL DEFAULT 0;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS delivery_max_km int NOT NULL DEFAULT 0;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lat double precision;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lng double precision;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_code text NOT NULL DEFAULT '';
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS distance_km double precision;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_id uuid REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS assigned_at timestamptz;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivered_at timestamptz;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivered_lat double precision;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivered_lng double precision;
+    CREATE TABLE IF NOT EXISTS couriers (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      phone text UNIQUE NOT NULL,
+      name text NOT NULL DEFAULT '',
+      active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS device_tokens (
+      token text PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      platform text NOT NULL DEFAULT 'android',
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_channel text NOT NULL DEFAULT '';
     ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS allow_card boolean NOT NULL DEFAULT true;
     ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS allow_mobile_money boolean NOT NULL DEFAULT true;
@@ -140,6 +251,8 @@ async function migrate() {
     ALTER TABLE products ENABLE ROW LEVEL SECURITY;
     ALTER TABLE shop_settings ENABLE ROW LEVEL SECURITY;
     ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE couriers ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE device_tokens ENABLE ROW LEVEL SECURITY;
   `);
 }
 
@@ -242,11 +355,18 @@ const auth = wrap(async (req, _res, next) => {
   } catch (_) {
     throw httpErr(401, 'Session expirée, reconnectez-vous.');
   }
-  const { rows } = await q('SELECT id, phone, name, role FROM users WHERE id=$1', [payload.sub]);
+  const { rows } = await q('SELECT id, phone, name, role, lang FROM users WHERE id=$1', [payload.sub]);
   if (!rows[0]) throw httpErr(401, 'Compte introuvable.');
-  req.user = rows[0];
+  req.user = await publicUser(rows[0]);
   next();
 });
+/** Rôle réel : propriétaire, livreur (numéro pré-enregistré par la propriétaire) ou client. */
+async function publicUser(row) {
+  const c = await q('SELECT 1 FROM couriers WHERE phone=$1 AND active', [row.phone]);
+  const role = row.role === 'admin' ? 'admin' : c.rowCount ? 'courier' : 'client';
+  return { id: row.id, phone: row.phone, name: row.name, role, lang: row.lang || 'fr' };
+}
+const courierOnly = (req, _res, next) => (req.user && req.user.role === 'courier' ? next() : next(httpErr(403, 'Réservé aux livreurs enregistrés.')));
 const adminOnly = (req, _res, next) => (req.user && req.user.role === 'admin' ? next() : next(httpErr(403, 'Réservé à la propriétaire.')));
 
 app.post('/auth/request-otp', otpLimiter, wrap(async (req, res) => {
@@ -290,37 +410,101 @@ app.post('/auth/verify-otp', otpLimiter, wrap(async (req, res) => {
      ON CONFLICT (phone) DO UPDATE SET
        role = CASE WHEN $4::boolean THEN 'admin' ELSE users.role END,
        name = CASE WHEN users.name = '' AND $2 <> '' THEN $2 ELSE users.name END
-     RETURNING id, phone, name, role`,
+     RETURNING id, phone, name, role, lang`,
     [phone, name, isAdmin ? 'admin' : 'client', isAdmin],
   )).rows[0];
+  const lang = String(req.body.lang || '');
+  if (LANGS.includes(lang) && lang !== user.lang) {
+    await q('UPDATE users SET lang=$1 WHERE id=$2', [lang, user.id]);
+    user.lang = lang;
+  }
   const token = jwt.sign({ sub: user.id }, JWT_SECRET, { expiresIn: '90d' });
-  res.json({ token, user });
+  res.json({ token, user: await publicUser(user) });
 }));
 
 app.get('/me', auth, (req, res) => res.json(req.user));
 app.patch('/me', auth, wrap(async (req, res) => {
-  const name = String(req.body.name || '').trim().slice(0, 60);
-  if (!name) throw httpErr(400, 'Prénom requis.');
-  const { rows } = await q('UPDATE users SET name=$1 WHERE id=$2 RETURNING id, phone, name, role', [name, req.user.id]);
-  res.json(rows[0]);
+  const sets = [];
+  const vals = [];
+  if (req.body.name !== undefined) {
+    const name = String(req.body.name || '').trim().slice(0, 60);
+    if (!name) throw httpErr(400, 'Prénom requis.');
+    vals.push(name);
+    sets.push(`name=$${vals.length}`);
+  }
+  if (req.body.lang !== undefined) {
+    const l = String(req.body.lang);
+    if (!LANGS.includes(l)) throw httpErr(400, 'Langue inconnue.');
+    vals.push(l);
+    sets.push(`lang=$${vals.length}`);
+  }
+  if (!sets.length) throw httpErr(400, 'Rien à modifier.');
+  vals.push(req.user.id);
+  const { rows } = await q(`UPDATE users SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING id, phone, name, role, lang`, vals);
+  res.json(await publicUser(rows[0]));
+}));
+
+// Jeton de notification de l'appareil (Firebase Cloud Messaging)
+app.post('/me/device-token', auth, wrap(async (req, res) => {
+  const t = String(req.body.token || '').trim();
+  if (t.length < 20 || t.length > 4096) throw httpErr(400, 'Jeton invalide.');
+  await q(
+    `INSERT INTO device_tokens (token, user_id, platform, updated_at) VALUES ($1,$2,$3,now())
+     ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, platform = EXCLUDED.platform, updated_at = now()`,
+    [t, req.user.id, String(req.body.platform || 'android').slice(0, 20)],
+  );
+  res.json({ ok: true });
+}));
+app.post('/me/device-token/remove', auth, wrap(async (req, res) => {
+  await q('DELETE FROM device_tokens WHERE token=$1 AND user_id=$2', [String(req.body.token || ''), req.user.id]);
+  res.json({ ok: true });
 }));
 
 // ── Catalogue (public) ───────────────────────────────────────────────────────
 app.get('/categories', wrap(async (_req, res) => {
-  res.json((await q('SELECT id, name, emoji, sort FROM categories ORDER BY sort, name')).rows);
+  res.json(await cached('c:categories', 60, async () => (await q('SELECT id, name, emoji, sort, image_url FROM categories ORDER BY sort, name')).rows));
 }));
 app.get('/products', wrap(async (_req, res) => {
-  res.json((await q(
-    `SELECT id, name, description, category_id, price, sizes, image_url, emoji, is_available, is_featured, prep_hours
+  res.json(await cached('c:products', 60, async () => (await q(
+    `SELECT id, name, description, category_id, price, currency, sizes, image_url, emoji, is_available, is_featured, prep_hours
        FROM products ORDER BY created_at`,
-  )).rows);
+  )).rows));
 }));
 const getSettings = async () => (await q('SELECT * FROM shop_settings WHERE id=1')).rows[0];
 app.get('/settings', wrap(async (_req, res) => {
-  const s = await getSettings();
-  delete s.id;
-  s.payment_providers = enabledProviders(); // ex. ['flutterwave','paystack'] (clés présentes sur le serveur)
-  res.json(s);
+  res.json(await cached('c:settings', 30, async () => {
+    const s = await getSettings();
+    delete s.id;
+    s.payment_providers = enabledProviders(); // ex. ['flutterwave','paystack'] (clés présentes sur le serveur)
+    return s;
+  }));
+}));
+
+// Météo gratuite (Open-Meteo) au point de la boutique, mise en cache 10 min
+app.get('/weather', wrap(async (_req, res) => {
+  const st = await getSettings();
+  if (st.shop_lat == null || st.shop_lng == null) return res.json({ available: false });
+  const w = await cached('c:weather', 600, async () => {
+    try {
+      const r = await fetch(`${env.WEATHER_BASE || 'https://api.open-meteo.com'}/v1/forecast?latitude=${st.shop_lat}&longitude=${st.shop_lng}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day&timezone=auto`);
+      const j = await r.json();
+      const c = j.current;
+      if (!c) return { available: false };
+      return { available: true, temp: c.temperature_2m, feels: c.apparent_temperature, humidity: c.relative_humidity_2m, code: c.weather_code, wind: c.wind_speed_10m, is_day: c.is_day === 1 };
+    } catch (_) { return { available: false }; }
+  });
+  res.json(w);
+}));
+
+// Estimation de la livraison : distance par la route, durée, frais, zone
+app.post('/delivery/quote', auth, wrap(async (req, res) => {
+  const lat = Number(req.body.lat);
+  const lng = Number(req.body.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw httpErr(400, 'Position invalide.');
+  const st = await getSettings();
+  const info = await deliveryInfo(st, lat, lng);
+  const within = !(st.delivery_max_km > 0 && info.km != null && info.km > st.delivery_max_km);
+  res.json({ distance_km: info.km, duration_min: info.min, fee: info.fee, max_km: st.delivery_max_km, within_zone: within });
 }));
 
 // ── Commandes (client) ───────────────────────────────────────────────────────
@@ -334,6 +518,16 @@ app.post('/orders', auth, wrap(async (req, res) => {
   const settings = await getSettings();
   const note = String(b.note || '').trim().slice(0, 500);
   const isCustom = b.is_custom === true;
+  let dLat = null;
+  let dLng = null;
+  if (type === 'delivery') {
+    const present = (v) => v !== null && v !== undefined && v !== '';
+    dLat = present(b.delivery_lat) ? Number(b.delivery_lat) : NaN;
+    dLng = present(b.delivery_lng) ? Number(b.delivery_lng) : NaN;
+    if (!Number.isFinite(dLat) || !Number.isFinite(dLng) || Math.abs(dLat) > 90 || Math.abs(dLng) > 180) {
+      throw httpErr(400, 'Indiquez la position de livraison sur la carte.');
+    }
+  }
 
   const items = [];
   let subtotal = 0;
@@ -360,12 +554,12 @@ app.post('/orders', auth, wrap(async (req, res) => {
       if (!p.is_available) throw httpErr(400, `« ${p.name} » n’est plus disponible.`);
       const qty = int(i.qty, 0);
       if (qty < 1 || qty > 50) throw httpErr(400, 'Quantité invalide.');
-      let unit = p.price;
+      let unit = toXof(p.price, p.currency, settings);
       let sizeLabel = '';
       if (Array.isArray(p.sizes) && p.sizes.length) {
         const s = p.sizes.find((x) => x.label === String(i.size));
         if (!s) throw httpErr(400, `Taille invalide pour « ${p.name} ».`);
-        unit = s.price;
+        unit = toXof(s.price, p.currency, settings);
         sizeLabel = s.label;
       }
       leadHours = Math.max(leadHours, p.prep_hours);
@@ -377,21 +571,38 @@ app.post('/orders', auth, wrap(async (req, res) => {
   if (when.getTime() < Date.now() + leadHours * 3600 * 1000 - 5 * 60 * 1000) {
     throw httpErr(400, `Délai minimum non respecté : commande possible à partir de ${leadHours} h.`);
   }
-  const fee = type === 'delivery' ? settings.delivery_fee : 0;
+  let fee = 0;
+  let distanceKm = null;
+  if (type === 'delivery') {
+    const info = await deliveryInfo(settings, dLat, dLng);
+    distanceKm = info.km;
+    if (settings.delivery_max_km > 0 && info.km != null && info.km > settings.delivery_max_km) {
+      throw httpErr(400, `Hors zone de livraison (${settings.delivery_max_km} km maximum).`);
+    }
+    fee = info.fee;
+  }
   const total = isCustom ? 0 : subtotal + fee;
   const wantsOnline = b.payment_method === 'online' && settings.online_payment && !isCustom
     && enabledProviders().length > 0 && (settings.allow_card || settings.allow_mobile_money);
   const paymentMethod = wantsOnline ? 'online' : 'cash';
   const paymentProvider = wantsOnline && enabledProviders().includes(b.payment_provider) ? b.payment_provider : '';
   const paymentChannel = wantsOnline && channelAllowed(String(b.payment_channel), settings) ? String(b.payment_channel) : '';
+  // Le livreur ne manipule jamais d'argent : une livraison se paie en ligne.
+  if (type === 'delivery' && !wantsOnline && !isCustom) {
+    throw httpErr(400, 'La livraison se paie en ligne : le livreur ne manipule jamais d’argent.');
+  }
+  const deliveryCode = type === 'delivery' ? String(crypto.randomInt(1000, 10000)) : '';
 
   const { rows } = await q(
-    `INSERT INTO orders (user_id, customer_name, phone, type, address, scheduled_at, payment_method, payment_provider, payment_channel, status, total, delivery_fee, note, items, is_custom, custom_details)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb) RETURNING *`,
+    `INSERT INTO orders (user_id, customer_name, phone, type, address, scheduled_at, payment_method, payment_provider, payment_channel, status, total, delivery_fee, note, items, is_custom, custom_details, delivery_lat, delivery_lng, delivery_code, distance_km)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb,$17,$18,$19,$20) RETURNING *`,
     [req.user.id, req.user.name || 'Client', req.user.phone, type, type === 'delivery' ? address : '', when.toISOString(),
-      paymentMethod, paymentProvider, paymentChannel, status, total, isCustom ? 0 : fee, note, JSON.stringify(items), isCustom, JSON.stringify(customDetails)],
+      paymentMethod, paymentProvider, paymentChannel, status, total, isCustom ? 0 : fee, note, JSON.stringify(items), isCustom, JSON.stringify(customDetails),
+      dLat, dLng, deliveryCode, distanceKm],
   );
-  res.status(201).json(rows[0]);
+  const created = rows[0];
+  pushAdmins(isCustom ? 'a_custom' : 'a_new', orderVars(created), { type: 'order', order_id: created.id });
+  res.status(201).json(created);
 }));
 
 app.get('/orders/mine', auth, wrap(async (req, res) => {
@@ -405,6 +616,7 @@ app.post('/orders/:id/accept-quote', auth, wrap(async (req, res) => {
     [req.params.id, req.user.id],
   );
   if (!rows[0]) throw httpErr(400, 'Aucun devis à accepter pour cette commande.');
+  pushAdmins('a_quote_accepted', orderVars(rows[0]), { type: 'order', order_id: rows[0].id });
   res.json(rows[0]);
 }));
 
@@ -416,6 +628,7 @@ app.post('/orders/:id/cancel', auth, wrap(async (req, res) => {
     [req.params.id, req.user.id],
   );
   if (!rows[0]) throw httpErr(400, 'Cette commande ne peut plus être annulée. Contactez la pâtisserie.');
+  pushAdmins('a_cancelled', orderVars(rows[0]), { type: 'order', order_id: rows[0].id });
   res.json(rows[0]);
 }));
 
@@ -522,6 +735,8 @@ async function confirmIfPaid(order) {
       `UPDATE orders SET payment_status='paid', status = CASE WHEN status='pending' THEN 'confirmed' ELSE status END, updated_at=now() WHERE id=$1`,
       [order.id],
     );
+    pushUser(order.user_id, 'paid', orderVars(order), { type: 'order', order_id: order.id });
+    pushAdmins('a_paid', orderVars(order), { type: 'order', order_id: order.id });
   }
   return res;
 }
@@ -609,6 +824,10 @@ app.get('/pay/return', (_req, res) => {
 // ── Espace propriétaire ──────────────────────────────────────────────────────
 const admin = express.Router();
 admin.use(auth, adminOnly);
+admin.use((req, res, next) => {
+  if (req.method !== 'GET') res.on('finish', () => bustCatalog());
+  next();
+});
 
 admin.get('/orders', wrap(async (_req, res) => {
   res.json((await q('SELECT * FROM orders ORDER BY created_at DESC LIMIT 500')).rows);
@@ -639,28 +858,43 @@ admin.patch('/orders/:id', wrap(async (req, res) => {
   const finalStatus = b.status !== undefined ? b.status : cur.status;
   const finalTotal = b.total !== undefined ? int(b.total) : cur.total;
   if (finalStatus === 'quoted' && finalTotal <= 0) throw httpErr(400, 'Indiquez un prix pour envoyer le devis.');
+  const finalPaid = b.payment_status !== undefined ? b.payment_status === 'paid' : cur.payment_status === 'paid';
+  if (cur.type === 'delivery' && ['ready', 'out_for_delivery'].includes(finalStatus) && !finalPaid) {
+    throw httpErr(400, 'Une commande à livrer doit être payée en ligne avant de partir.');
+  }
   sets.push('updated_at=now()');
   vals.push(req.params.id);
   const { rows } = await q(`UPDATE orders SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals);
-  if (b.status !== undefined && b.status !== cur.status) notifyStatus(rows[0]);
-  res.json(rows[0]);
+  const o = rows[0];
+  if (b.status !== undefined && b.status !== cur.status) {
+    notifyStatus(o);
+    const ev = statusEvent(o);
+    if (ev) pushUser(o.user_id, ev, orderVars(o), { type: 'order', order_id: o.id });
+    if (o.status === 'ready' && o.courier_id) pushUser(o.courier_id, 'courier_ready', orderVars(o), { type: 'delivery', order_id: o.id });
+  }
+  res.json(o);
 }));
 
-// Catégories
-admin.post('/categories', wrap(async (req, res) => {
+// Catégories (= « grands noms » avec leur image) — envoi multipart possible
+admin.post('/categories', upload.single('image'), wrap(async (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 60);
   if (!name) throw httpErr(400, 'Nom requis.');
   const emoji = (String(req.body.emoji || '🍰').trim() || '🍰').slice(0, 8);
-  const { rows } = await q('INSERT INTO categories (name, emoji, sort) VALUES ($1,$2,$3) RETURNING *', [name, emoji, int(req.body.sort, 0)]);
+  const image = req.file ? await storeImage(req.file.buffer, 'categories') : null;
+  const { rows } = await q('INSERT INTO categories (name, emoji, sort, image_url) VALUES ($1,$2,$3,$4) RETURNING *', [name, emoji, int(req.body.sort, 0), image]);
   res.status(201).json(rows[0]);
 }));
-admin.patch('/categories/:id', wrap(async (req, res) => {
+admin.patch('/categories/:id', upload.single('image'), wrap(async (req, res) => {
   if (!isUuid(req.params.id)) throw httpErr(404, 'Catégorie introuvable.');
+  const cur = (await q('SELECT image_url FROM categories WHERE id=$1', [req.params.id])).rows[0];
+  if (!cur) throw httpErr(404, 'Catégorie introuvable.');
   const name = String(req.body.name || '').trim().slice(0, 60);
   if (!name) throw httpErr(400, 'Nom requis.');
   const emoji = (String(req.body.emoji || '🍰').trim() || '🍰').slice(0, 8);
-  const { rows } = await q('UPDATE categories SET name=$1, emoji=$2, sort=$3 WHERE id=$4 RETURNING *', [name, emoji, int(req.body.sort, 0), req.params.id]);
-  if (!rows[0]) throw httpErr(404, 'Catégorie introuvable.');
+  let image = cur.image_url;
+  if (req.file) image = await storeImage(req.file.buffer, 'categories');
+  else if (bool(req.body.remove_image)) image = null;
+  const { rows } = await q('UPDATE categories SET name=$1, emoji=$2, sort=$3, image_url=$4 WHERE id=$5 RETURNING *', [name, emoji, int(req.body.sort, 0), image, req.params.id]);
   res.json(rows[0]);
 }));
 admin.delete('/categories/:id', wrap(async (req, res) => {
@@ -679,16 +913,18 @@ function parseProduct(body) {
   }
   if (!Array.isArray(sizes)) throw httpErr(400, 'Tailles invalides.');
   sizes = sizes
-    .map((s) => ({ label: String(s.label || '').trim().slice(0, 40), price: int(s.price, 0) }))
+    .map((s) => ({ label: String(s.label || '').trim().slice(0, 40), price: num2(s.price) }))
     .filter((s) => s.label && s.price > 0)
     .slice(0, 12);
-  const price = Math.max(0, int(body.price, 0));
+  const price = Math.max(0, num2(body.price));
+  const currency = CURRENCIES.includes(String(body.currency)) ? String(body.currency) : 'XOF';
   if (!sizes.length && price <= 0) throw httpErr(400, 'Indiquez un prix ou au moins une taille.');
   return {
     name: name.slice(0, 120),
     description: String(body.description || '').slice(0, 1000),
     category_id: isUuid(body.category_id) ? body.category_id : null,
     price,
+    currency,
     sizes,
     emoji: (String(body.emoji || '🍰').trim() || '🍰').slice(0, 8),
     is_available: bool(body.is_available, true),
@@ -701,9 +937,9 @@ admin.post('/products', upload.single('image'), wrap(async (req, res) => {
   const p = parseProduct(req.body);
   const image = req.file ? await storeImage(req.file.buffer, 'products') : null;
   const { rows } = await q(
-    `INSERT INTO products (name, description, category_id, price, sizes, image_url, emoji, is_available, is_featured, prep_hours)
-     VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10) RETURNING *`,
-    [p.name, p.description, p.category_id, p.price, JSON.stringify(p.sizes), image, p.emoji, p.is_available, p.is_featured, p.prep_hours],
+    `INSERT INTO products (name, description, category_id, price, currency, sizes, image_url, emoji, is_available, is_featured, prep_hours)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11) RETURNING *`,
+    [p.name, p.description, p.category_id, p.price, p.currency, JSON.stringify(p.sizes), image, p.emoji, p.is_available, p.is_featured, p.prep_hours],
   );
   res.status(201).json(rows[0]);
 }));
@@ -717,9 +953,9 @@ admin.patch('/products/:id', upload.single('image'), wrap(async (req, res) => {
   if (req.file) image = await storeImage(req.file.buffer, 'products');
   else if (bool(req.body.remove_image)) image = null;
   const { rows } = await q(
-    `UPDATE products SET name=$1, description=$2, category_id=$3, price=$4, sizes=$5::jsonb, image_url=$6, emoji=$7,
-       is_available=$8, is_featured=$9, prep_hours=$10 WHERE id=$11 RETURNING *`,
-    [p.name, p.description, p.category_id, p.price, JSON.stringify(p.sizes), image, p.emoji, p.is_available, p.is_featured, p.prep_hours, req.params.id],
+    `UPDATE products SET name=$1, description=$2, category_id=$3, price=$4, currency=$5, sizes=$6::jsonb, image_url=$7, emoji=$8,
+       is_available=$9, is_featured=$10, prep_hours=$11 WHERE id=$12 RETURNING *`,
+    [p.name, p.description, p.category_id, p.price, p.currency, JSON.stringify(p.sizes), image, p.emoji, p.is_available, p.is_featured, p.prep_hours, req.params.id],
   );
   res.json(rows[0]);
 }));
@@ -734,25 +970,254 @@ admin.delete('/products/:id', wrap(async (req, res) => {
 admin.patch('/settings', wrap(async (req, res) => {
   const b = req.body || {};
   const cur = await getSettings();
+  const pos = (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; };
+  const coord = (v, d, max) => { if (v === null || v === '') return null; const n = Number(v); return Number.isFinite(n) && Math.abs(n) <= max ? n : d; };
   const next = {
     shop_name: b.shop_name !== undefined ? (String(b.shop_name).trim().slice(0, 80) || cur.shop_name) : cur.shop_name,
     is_open: b.is_open !== undefined ? bool(b.is_open, cur.is_open) : cur.is_open,
     delivery_fee: b.delivery_fee !== undefined ? Math.max(0, int(b.delivery_fee, cur.delivery_fee)) : cur.delivery_fee,
+    delivery_per_km: b.delivery_per_km !== undefined ? Math.max(0, int(b.delivery_per_km, cur.delivery_per_km)) : cur.delivery_per_km,
+    delivery_max_km: b.delivery_max_km !== undefined ? Math.max(0, int(b.delivery_max_km, cur.delivery_max_km)) : cur.delivery_max_km,
     min_lead_hours: b.min_lead_hours !== undefined ? Math.min(720, Math.max(0, int(b.min_lead_hours, cur.min_lead_hours))) : cur.min_lead_hours,
     online_payment: b.online_payment !== undefined ? bool(b.online_payment, cur.online_payment) : cur.online_payment,
     allow_card: b.allow_card !== undefined ? bool(b.allow_card, cur.allow_card) : cur.allow_card,
     allow_mobile_money: b.allow_mobile_money !== undefined ? bool(b.allow_mobile_money, cur.allow_mobile_money) : cur.allow_mobile_money,
+    rate_usd: b.rate_usd !== undefined ? pos(b.rate_usd, cur.rate_usd) : cur.rate_usd,
+    rate_eur: b.rate_eur !== undefined ? pos(b.rate_eur, cur.rate_eur) : cur.rate_eur,
+    rate_gbp: b.rate_gbp !== undefined ? pos(b.rate_gbp, cur.rate_gbp) : cur.rate_gbp,
+    shop_lat: b.shop_lat !== undefined ? coord(b.shop_lat, cur.shop_lat, 90) : cur.shop_lat,
+    shop_lng: b.shop_lng !== undefined ? coord(b.shop_lng, cur.shop_lng, 180) : cur.shop_lng,
     whatsapp: b.whatsapp !== undefined ? String(b.whatsapp).trim().slice(0, 30) : cur.whatsapp,
     opening_hours: b.opening_hours !== undefined ? String(b.opening_hours).trim().slice(0, 120) : cur.opening_hours,
     address: b.address !== undefined ? String(b.address).trim().slice(0, 200) : cur.address,
   };
   await q(
-    `UPDATE shop_settings SET shop_name=$1, is_open=$2, delivery_fee=$3, min_lead_hours=$4, online_payment=$5, allow_card=$6, allow_mobile_money=$7, whatsapp=$8, opening_hours=$9, address=$10 WHERE id=1`,
-    [next.shop_name, next.is_open, next.delivery_fee, next.min_lead_hours, next.online_payment, next.allow_card, next.allow_mobile_money, next.whatsapp, next.opening_hours, next.address],
+    `UPDATE shop_settings SET shop_name=$1, is_open=$2, delivery_fee=$3, delivery_per_km=$4, delivery_max_km=$5, min_lead_hours=$6,
+       online_payment=$7, allow_card=$8, allow_mobile_money=$9, rate_usd=$10, rate_eur=$11, rate_gbp=$12, shop_lat=$13, shop_lng=$14,
+       whatsapp=$15, opening_hours=$16, address=$17 WHERE id=1`,
+    [next.shop_name, next.is_open, next.delivery_fee, next.delivery_per_km, next.delivery_max_km, next.min_lead_hours, next.online_payment,
+      next.allow_card, next.allow_mobile_money, next.rate_usd, next.rate_eur, next.rate_gbp, next.shop_lat, next.shop_lng,
+      next.whatsapp, next.opening_hours, next.address],
   );
+  await kvDel('c:weather');
   res.json(next);
 }));
+
+// Livreurs : numéros pré-enregistrés par la propriétaire (seuls ces numéros deviennent livreurs)
+admin.get('/couriers', wrap(async (_req, res) => {
+  res.json((await q(
+    `SELECT u.id, c.phone, COALESCE(NULLIF(c.name,''), u.name) AS name, c.active
+       FROM couriers c LEFT JOIN users u ON u.phone = c.phone ORDER BY c.created_at`,
+  )).rows);
+}));
+admin.post('/couriers', wrap(async (req, res) => {
+  const phone = digits(req.body.phone);
+  if (phone.length < 8 || phone.length > 15) throw httpErr(400, 'Numéro de téléphone invalide.');
+  const name = String(req.body.name || '').trim().slice(0, 60);
+  await q('INSERT INTO couriers (phone, name) VALUES ($1,$2) ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, active = true', [phone, name]);
+  await q('INSERT INTO users (phone, name) VALUES ($1,$2) ON CONFLICT (phone) DO NOTHING', [phone, name]);
+  const row = (await q(`SELECT u.id, c.phone, COALESCE(NULLIF(c.name,''), u.name) AS name, c.active FROM couriers c JOIN users u ON u.phone=c.phone WHERE c.phone=$1`, [phone])).rows[0];
+  res.status(201).json(row);
+}));
+admin.patch('/couriers/:id', wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Livreur introuvable.');
+  const u = (await q('SELECT phone FROM users WHERE id=$1', [req.params.id])).rows[0];
+  if (!u) throw httpErr(404, 'Livreur introuvable.');
+  if (req.body.active !== undefined) await q('UPDATE couriers SET active=$1 WHERE phone=$2', [bool(req.body.active, true), u.phone]);
+  if (req.body.name !== undefined) await q('UPDATE couriers SET name=$1 WHERE phone=$2', [String(req.body.name).trim().slice(0, 60), u.phone]);
+  res.json({ ok: true });
+}));
+admin.delete('/couriers/:id', wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Livreur introuvable.');
+  await q('DELETE FROM couriers WHERE phone = (SELECT phone FROM users WHERE id=$1)', [req.params.id]);
+  res.json({ ok: true });
+}));
+
+// Affecter une commande à livrer à un livreur (la commande doit être payée en ligne)
+admin.post('/orders/:id/assign', wrap(async (req, res) => {
+  if (!isUuid(req.params.id) || !isUuid(req.body.courier_id)) throw httpErr(400, 'Données invalides.');
+  const o = (await q('SELECT * FROM orders WHERE id=$1', [req.params.id])).rows[0];
+  if (!o) throw httpErr(404, 'Commande introuvable.');
+  if (o.type !== 'delivery') throw httpErr(400, 'Cette commande est à retirer en boutique.');
+  if (o.payment_status !== 'paid') throw httpErr(400, 'Une commande à livrer doit être payée en ligne avant d’être confiée à un livreur.');
+  if (['completed', 'cancelled'].includes(o.status)) throw httpErr(400, 'Commande déjà clôturée.');
+  const c = (await q('SELECT u.id FROM users u JOIN couriers c ON c.phone=u.phone AND c.active WHERE u.id=$1', [req.body.courier_id])).rows[0];
+  if (!c) throw httpErr(400, 'Livreur inconnu ou désactivé.');
+  const { rows } = await q('UPDATE orders SET courier_id=$1, assigned_at=now(), updated_at=now() WHERE id=$2 RETURNING *', [c.id, o.id]);
+  pushUser(c.id, 'courier_new', orderVars(rows[0]), { type: 'delivery', order_id: o.id });
+  res.json(rows[0]);
+}));
 app.use('/admin', admin);
+
+// ── Livreur : liste, démarrage, position en direct, fin de livraison ──────────
+const courierView = (o) => ({
+  id: o.id, code: o.code, status: o.status, customer_name: o.customer_name, phone: o.phone, address: o.address,
+  delivery_lat: o.delivery_lat, delivery_lng: o.delivery_lng, scheduled_at: o.scheduled_at, note: o.note,
+  distance_km: o.distance_km, assigned_at: o.assigned_at,
+  items: (o.items || []).map((i) => ({ name: i.name, size: i.size, qty: i.qty, note: i.note, emoji: i.emoji })),
+}); // jamais de prix ni de code de livraison pour le livreur
+
+app.get('/courier/deliveries', auth, courierOnly, wrap(async (req, res) => {
+  const { rows } = await q(
+    `SELECT * FROM orders WHERE courier_id=$1 AND status IN ('ready','out_for_delivery') ORDER BY scheduled_at`,
+    [req.user.id],
+  );
+  res.json(rows.map(courierView));
+}));
+
+app.post('/courier/deliveries/:id/start', auth, courierOnly, wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Livraison introuvable.');
+  const { rows } = await q(
+    `UPDATE orders SET status='out_for_delivery', updated_at=now() WHERE id=$1 AND courier_id=$2 AND status='ready' RETURNING *`,
+    [req.params.id, req.user.id],
+  );
+  if (!rows[0]) throw httpErr(400, 'Cette livraison ne peut pas démarrer maintenant (commande pas encore prête ?).');
+  pushUser(rows[0].user_id, 'out_for_delivery', orderVars(rows[0]), { type: 'order', order_id: rows[0].id });
+  res.json(courierView(rows[0]));
+}));
+
+app.post('/courier/location', auth, courierOnly, wrap(async (req, res) => {
+  const lat = Number(req.body.lat);
+  const lng = Number(req.body.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw httpErr(400, 'Position invalide.');
+  await kvSet(`courier:${req.user.id}`, { lat, lng, speed: Number(req.body.speed) || 0, heading: Number(req.body.heading) || 0, ts: Date.now() }, 180);
+  res.json({ ok: true });
+}));
+
+app.post('/courier/deliveries/:id/complete', auth, courierOnly, wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Livraison introuvable.');
+  const o = (await q(`SELECT * FROM orders WHERE id=$1 AND courier_id=$2 AND status IN ('ready','out_for_delivery')`, [req.params.id, req.user.id])).rows[0];
+  if (!o) throw httpErr(404, 'Livraison introuvable.');
+  // Le client donne son code de livraison au livreur : preuve que la remise a eu lieu (5 essais maximum)
+  const tries = (await kvGet(`dcode:${o.id}`)) || 0;
+  if (tries >= 5) throw httpErr(429, 'Trop d’essais. Contactez la pâtisserie.');
+  if (String(req.body.code || '').trim() !== o.delivery_code) {
+    await kvSet(`dcode:${o.id}`, tries + 1, 3600);
+    throw httpErr(400, 'Code de livraison incorrect : demandez-le au client.');
+  }
+  const lat = Number(req.body.lat);
+  const lng = Number(req.body.lng);
+  const { rows } = await q(
+    `UPDATE orders SET status='completed', delivered_at=now(), delivered_lat=$1, delivered_lng=$2, updated_at=now() WHERE id=$3 RETURNING *`,
+    [Number.isFinite(lat) ? lat : null, Number.isFinite(lng) ? lng : null, o.id],
+  );
+  await kvDel(`dcode:${o.id}`);
+  pushUser(o.user_id, 'delivered', orderVars(rows[0]), { type: 'order', order_id: o.id });
+  pushAdmins('a_delivered', orderVars(rows[0]), { type: 'order', order_id: o.id });
+  res.json({ ok: true }); // la commande disparaît de la liste du livreur (statut terminé)
+}));
+
+// Suivi en direct (client propriétaire de la commande, ou propriétaire de la boutique)
+app.get('/orders/:id/tracking', auth, wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Commande introuvable.');
+  const o = (await q('SELECT * FROM orders WHERE id=$1', [req.params.id])).rows[0];
+  if (!o || (o.user_id !== req.user.id && req.user.role !== 'admin')) throw httpErr(404, 'Commande introuvable.');
+  const st = await getSettings();
+  const out = { status: o.status, delivery_lat: o.delivery_lat, delivery_lng: o.delivery_lng, shop_lat: st.shop_lat, shop_lng: st.shop_lng, courier: null, delivered_at: o.delivered_at };
+  if (o.courier_id) {
+    const u = (await q('SELECT name FROM users WHERE id=$1', [o.courier_id])).rows[0];
+    const pos = o.status === 'out_for_delivery' ? await kvGet(`courier:${o.courier_id}`) : null;
+    out.courier = { name: u ? String(u.name || '').split(' ')[0] : '', lat: pos ? pos.lat : null, lng: pos ? pos.lng : null, heading: pos ? pos.heading : 0, ts: pos ? pos.ts : null };
+  }
+  res.json(out);
+}));
+
+// ── Notifications push (Firebase Cloud Messaging, API HTTP v1) ───────────────
+const FCM_ENABLED = !!(env.FIREBASE_PROJECT_ID && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY);
+const GOOGLE_TOKEN_URL = env.GOOGLE_TOKEN_URL || 'https://oauth2.googleapis.com/token';
+const FCM_BASE = env.FCM_BASE || 'https://fcm.googleapis.com';
+let fcmAuth = { token: null, exp: 0 };
+async function fcmAccessToken() {
+  if (fcmAuth.token && Date.now() < fcmAuth.exp - 60000) return fcmAuth.token;
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = jwt.sign(
+    { iss: env.FIREBASE_CLIENT_EMAIL, scope: 'https://www.googleapis.com/auth/firebase.messaging', aud: GOOGLE_TOKEN_URL, iat: now, exp: now + 3600 },
+    env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    { algorithm: 'RS256' },
+  );
+  const r = await fetch(GOOGLE_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }),
+  });
+  const j = await jsonOf(r);
+  if (!r.ok || !j.access_token) throw new Error((j && (j.error_description || j.error)) || 'jeton Google refusé');
+  fcmAuth = { token: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+  return fcmAuth.token;
+}
+
+// Textes des notifications par langue (repli : français). Variables : {code} {total} {addr} {name}
+const PUSH = {
+  confirmed: { fr: ['Commande confirmée ✔', '{code} a été confirmée.'], en: ['Order confirmed ✔', '{code} has been confirmed.'], es: ['Pedido confirmado ✔', '{code} ha sido confirmado.'], pt: ['Pedido confirmado ✔', '{code} foi confirmado.'], ar: ['تم تأكيد الطلب ✔', 'تم تأكيد الطلب {code}.'], zh: ['订单已确认 ✔', '订单 {code} 已确认。'], ha: ['An tabbatar da odarka ✔', 'An tabbatar da {code}.'], yo: ['A ti jẹ́rìí ìbéèrè rẹ ✔', 'A ti jẹ́rìí {code}.'] },
+  preparing: { fr: ['En préparation 👩‍🍳', '{code} est en cours de préparation.'], en: ['Being prepared 👩‍🍳', '{code} is being prepared.'], es: ['En preparación 👩‍🍳', '{code} se está preparando.'], pt: ['Em preparação 👩‍🍳', '{code} está a ser preparado.'], ar: ['قيد التحضير 👩‍🍳', 'الطلب {code} قيد التحضير.'], zh: ['制作中 👩‍🍳', '订单 {code} 正在制作。'], ha: ['Ana shirya odarka 👩‍🍳', 'Ana shirya {code}.'], yo: ['À ń ṣe ìbéèrè rẹ 👩‍🍳', 'À ń ṣe {code}.'] },
+  ready_pickup: { fr: ['Prête à retirer 🎂', '{code} vous attend en boutique.'], en: ['Ready for pickup 🎂', '{code} is waiting for you in the shop.'], es: ['Listo para recoger 🎂', '{code} te espera en la tienda.'], pt: ['Pronto para levantar 🎂', '{code} espera por si na loja.'], ar: ['جاهز للاستلام 🎂', 'الطلب {code} في انتظارك في المتجر.'], zh: ['可取货 🎂', '订单 {code} 已在店内等您。'], ha: ['Ya shirya, zo ka karɓa 🎂', '{code} yana jiranka a shago.'], yo: ['Ó ti ṣetán 🎂', '{code} ń dúró dè ọ́ ní ṣọ́ọ̀bù.'] },
+  ready_delivery: { fr: ['Prête à partir 🚚', '{code} va être remise au livreur.'], en: ['Ready to go 🚚', '{code} will be handed to the courier.'], es: ['Listo para salir 🚚', '{code} se entregará al repartidor.'], pt: ['Pronto para sair 🚚', '{code} vai ser entregue ao estafeta.'], ar: ['جاهز للانطلاق 🚚', 'سيُسلَّم الطلب {code} إلى المندوب.'], zh: ['准备出发 🚚', '订单 {code} 即将交给配送员。'], ha: ['Ya shirya za a tafi 🚚', 'Za a ba mai kai kaya {code}.'], yo: ['Ó ti ṣetán láti jáde 🚚', 'A ó fi {code} fún olùgbéránṣẹ́.'] },
+  out_for_delivery: { fr: ['En route 🚚', 'Le livreur est en chemin avec {code}.'], en: ['On the way 🚚', 'The courier is on the way with {code}.'], es: ['En camino 🚚', 'El repartidor va en camino con {code}.'], pt: ['A caminho 🚚', 'O estafeta vai a caminho com {code}.'], ar: ['في الطريق 🚚', 'المندوب في طريقه إليك بالطلب {code}.'], zh: ['配送中 🚚', '配送员正带着订单 {code} 赶来。'], ha: ['Yana kan hanya 🚚', 'Mai kai kaya yana kan hanya da {code}.'], yo: ['Ó wà lójú ọ̀nà 🚚', 'Olùgbéránṣẹ́ wà lójú ọ̀nà pẹ̀lú {code}.'] },
+  completed: { fr: ['Merci ! 🧁', '{code} est terminée. Bon appétit !'], en: ['Thank you! 🧁', '{code} is complete. Enjoy!'], es: ['¡Gracias! 🧁', '{code} está completado. ¡Buen provecho!'], pt: ['Obrigado! 🧁', '{code} está concluído. Bom apetite!'], ar: ['شكرًا لك! 🧁', 'اكتمل الطلب {code}. بالهناء والشفاء!'], zh: ['谢谢！🧁', '订单 {code} 已完成，祝您好胃口！'], ha: ['Mun gode! 🧁', 'An kammala {code}. Ci abinci lafiya!'], yo: ['Ẹ ṣé! 🧁', '{code} ti parí. Ẹ jẹun dáadáa!'] },
+  delivered: { fr: ['Livrée ✔', '{code} a été livrée. Bon appétit !'], en: ['Delivered ✔', '{code} has been delivered. Enjoy!'], es: ['Entregado ✔', '{code} ha sido entregado. ¡Buen provecho!'], pt: ['Entregue ✔', '{code} foi entregue. Bom apetite!'], ar: ['تم التسليم ✔', 'تم تسليم الطلب {code}. بالهناء والشفاء!'], zh: ['已送达 ✔', '订单 {code} 已送达，祝您好胃口！'], ha: ['An kawo ✔', 'An kawo {code}. Ci abinci lafiya!'], yo: ['A ti fi ránṣẹ́ ✔', 'A ti fi {code} ránṣẹ́. Ẹ jẹun dáadáa!'] },
+  cancelled: { fr: ['Commande annulée', '{code} a été annulée.'], en: ['Order cancelled', '{code} has been cancelled.'], es: ['Pedido cancelado', '{code} ha sido cancelado.'], pt: ['Pedido cancelado', '{code} foi cancelado.'], ar: ['تم إلغاء الطلب', 'تم إلغاء الطلب {code}.'], zh: ['订单已取消', '订单 {code} 已取消。'], ha: ['An soke odar', 'An soke {code}.'], yo: ['A ti fagilé ìbéèrè', 'A ti fagilé {code}.'] },
+  quoted: { fr: ['Votre devis est prêt 💬', '{code} : {total}. Ouvrez l’application pour répondre.'], en: ['Your quote is ready 💬', '{code}: {total}. Open the app to reply.'], es: ['Tu presupuesto está listo 💬', '{code}: {total}. Abre la app para responder.'], pt: ['O seu orçamento está pronto 💬', '{code}: {total}. Abra a aplicação para responder.'], ar: ['عرض السعر جاهز 💬', '{code}: {total}. افتح التطبيق للرد.'], zh: ['您的报价已就绪 💬', '{code}：{total}。请打开应用回复。'], ha: ['Farashin ya shirya 💬', '{code}: {total}. Bude manhajar don amsawa.'], yo: ['Iye owó ti ṣetán 💬', '{code}: {total}. Ṣí ohun èlò náà láti dáhùn.'] },
+  paid: { fr: ['Paiement reçu ✔', 'Merci ! Le paiement de {code} est confirmé.'], en: ['Payment received ✔', 'Thank you! Payment for {code} is confirmed.'], es: ['Pago recibido ✔', '¡Gracias! El pago de {code} está confirmado.'], pt: ['Pagamento recebido ✔', 'Obrigado! O pagamento de {code} está confirmado.'], ar: ['تم استلام الدفع ✔', 'شكرًا! تم تأكيد دفع الطلب {code}.'], zh: ['已收到付款 ✔', '谢谢！订单 {code} 的付款已确认。'], ha: ['An karɓi biyan kuɗi ✔', 'Mun gode! An tabbatar da biyan {code}.'], yo: ['A ti gba owó rẹ ✔', 'Ẹ ṣé! A ti jẹ́rìí owó {code}.'] },
+  courier_new: { fr: ['Nouvelle livraison 🚚', '{code} · {addr}'], en: ['New delivery 🚚', '{code} · {addr}'], es: ['Nueva entrega 🚚', '{code} · {addr}'], pt: ['Nova entrega 🚚', '{code} · {addr}'], ar: ['توصيلة جديدة 🚚', '{code} · {addr}'], zh: ['新的配送任务 🚚', '{code} · {addr}'], ha: ['Sabon isar da kaya 🚚', '{code} · {addr}'], yo: ['Ìfijíṣẹ́ tuntun 🚚', '{code} · {addr}'] },
+  courier_ready: { fr: ['Commande prête 🎂', '{code} est prête : venez la récupérer.'], en: ['Order ready 🎂', '{code} is ready: come and pick it up.'], es: ['Pedido listo 🎂', '{code} está listo: ven a recogerlo.'], pt: ['Pedido pronto 🎂', '{code} está pronto: venha buscá-lo.'], ar: ['الطلب جاهز 🎂', 'الطلب {code} جاهز: تعال لاستلامه.'], zh: ['订单已备好 🎂', '订单 {code} 已备好，请前来取件。'], ha: ['Odar ta shirya 🎂', '{code} ta shirya: zo ka ɗauka.'], yo: ['Ìbéèrè ti ṣetán 🎂', '{code} ti ṣetán: wá gbà á.'] },
+  a_new: { fr: ['Nouvelle commande 🧁', '{name} · {code} · {total}'], en: ['New order 🧁', '{name} · {code} · {total}'] },
+  a_custom: { fr: ['Demande sur mesure ✨', '{name} · {code}'], en: ['Custom cake request ✨', '{name} · {code}'] },
+  a_paid: { fr: ['Paiement reçu 💰', '{code} · {total}'], en: ['Payment received 💰', '{code} · {total}'] },
+  a_delivered: { fr: ['Livraison terminée ✔', '{code} remise à {name} (code client confirmé).'], en: ['Delivery completed ✔', '{code} handed to {name} (customer code confirmed).'] },
+  a_quote_accepted: { fr: ['Devis accepté ✔', '{code} · {total}'], en: ['Quote accepted ✔', '{code} · {total}'] },
+  a_cancelled: { fr: ['Commande annulée', '{code} annulée par le client.'], en: ['Order cancelled', '{code} cancelled by the customer.'] },
+};
+const fmtTotal = (n) => `${Number(n || 0).toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, ' ')} FCFA`;
+function orderVars(o) {
+  return { code: o.code, total: fmtTotal(o.total), addr: o.address || '', name: o.customer_name || '' };
+}
+function statusEvent(o) {
+  const m = { confirmed: 'confirmed', preparing: 'preparing', ready: o.type === 'delivery' ? 'ready_delivery' : 'ready_pickup', out_for_delivery: 'out_for_delivery', completed: o.type === 'delivery' ? 'delivered' : 'completed', cancelled: 'cancelled', quoted: 'quoted' };
+  return m[o.status] || null;
+}
+function renderPush(ev, lang, vars) {
+  const t = PUSH[ev];
+  if (!t) return null;
+  const pair = t[lang] || t.fr;
+  const fill = (str) => str.replace(/\{(\w+)\}/g, (_m, k) => (vars[k] != null ? String(vars[k]) : ''));
+  return { title: fill(pair[0]), body: fill(pair[1]) };
+}
+
+async function sendPush(userIds, event, vars, data = {}) {
+  if (!FCM_ENABLED || !userIds.length) return;
+  try {
+    const { rows } = await q(
+      `SELECT d.token, u.lang FROM device_tokens d JOIN users u ON u.id = d.user_id WHERE d.user_id = ANY($1::uuid[])`,
+      [userIds],
+    );
+    if (!rows.length) return;
+    const access = await fcmAccessToken();
+    const strData = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)]));
+    for (const { token, lang } of rows) {
+      const msg = renderPush(event, lang, vars);
+      if (!msg) continue;
+      const r = await fetch(`${FCM_BASE}/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: { token, notification: { title: msg.title, body: msg.body }, data: strData, android: { priority: 'HIGH', notification: { sound: 'default' } } } }),
+      });
+      if (!r.ok) {
+        const j = await jsonOf(r);
+        const code = j && j.error && ((j.error.details && j.error.details[0] && j.error.details[0].errorCode) || j.error.status);
+        if (r.status === 404 || code === 'UNREGISTERED' || code === 'NOT_FOUND') await q('DELETE FROM device_tokens WHERE token=$1', [token]);
+        else console.error('[FCM]', r.status, JSON.stringify(j).slice(0, 200));
+      }
+    }
+  } catch (e) {
+    console.error('[push]', e.message);
+  }
+}
+function pushUser(userId, event, vars, data) {
+  if (userId) sendPush([userId], event, vars, data).catch(() => {});
+}
+function pushAdmins(event, vars, data) {
+  q(`SELECT id FROM users WHERE role='admin'`).then((r) => sendPush(r.rows.map((x) => x.id), event, vars, data)).catch(() => {});
+}
 
 // ── Erreurs ──────────────────────────────────────────────────────────────────
 app.use((req, res) => res.status(404).json({ error: 'Route introuvable.' }));
