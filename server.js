@@ -11,6 +11,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt');
 const multer = require('multer');
 const Redis = require('ioredis');
 const { Pool } = require('pg');
@@ -74,7 +75,7 @@ async function cached(key, ttl, fn) {
 const bustCatalog = () => kvDel('c:categories', 'c:products', 'c:settings');
 
 // ── Utilitaires ──────────────────────────────────────────────────────────────
-const httpErr = (status, message) => Object.assign(new Error(message), { status });
+const httpErr = (status, message, extra = {}) => Object.assign(new Error(message), { status, code: extra.code, retry_after: extra.retry_after });
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const digits = (s) => String(s || '').replace(/\D/g, '');
 const isUuid = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s));
@@ -128,15 +129,46 @@ async function deliveryInfo(settings, lat, lng) {
 const STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'out_for_delivery', 'completed', 'cancelled', 'quote_pending', 'quoted'];
 
 // ── Base de données : création automatique des tables ────────────────────────
+async function seedResponsable() {
+  if (!env.ADMIN_PHONE) return;
+  const ap = digits(env.ADMIN_PHONE);
+  if (ap.length < 8) return;
+  await q(
+    `INSERT INTO users (phone, name, role)
+     VALUES ($1, 'Responsable', 'admin')
+     ON CONFLICT (phone) DO UPDATE SET role = 'admin'`,
+    [ap],
+  );
+  console.log('[seed] Responsable pré-enregistré : +' + ap);
+}
+
 async function migrate() {
   await q(`
     CREATE TABLE IF NOT EXISTS users (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
       phone text UNIQUE NOT NULL,
       name text NOT NULL DEFAULT '',
-      role text NOT NULL DEFAULT 'client' CHECK (role IN ('client','admin')),
+      role text NOT NULL DEFAULT 'client',
       created_at timestamptz NOT NULL DEFAULT now()
     );
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS lang text DEFAULT 'fr';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_payment text DEFAULT 'cash';
+    -- rôles : client (acheteur) | admin (responsable) | courier (livreur)
+    DO $$ BEGIN
+      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+      ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('client','admin','courier'));
+    EXCEPTION WHEN others THEN NULL;
+    END $$;
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (lower(email)) WHERE email IS NOT NULL AND email <> '';
+
+    CREATE TABLE IF NOT EXISTS otp_requests (
+      phone text NOT NULL,
+      requested_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS otp_requests_phone_time ON otp_requests (phone, requested_at DESC);
 
     CREATE TABLE IF NOT EXISTS otp_codes (
       phone text PRIMARY KEY,
@@ -386,7 +418,7 @@ const auth = wrap(async (req, _res, next) => {
   } catch (_) {
     throw httpErr(401, 'Session expirée, reconnectez-vous.');
   }
-  const { rows } = await q('SELECT id, phone, name, role, lang FROM users WHERE id=$1', [payload.sub]);
+  const { rows } = await q('SELECT id, phone, name, role, lang, email, preferred_payment FROM users WHERE id=$1', [payload.sub]);
   if (!rows[0]) throw httpErr(401, 'Compte introuvable.');
   req.user = await publicUser(rows[0]);
   next();
@@ -395,18 +427,32 @@ const auth = wrap(async (req, _res, next) => {
 async function publicUser(row) {
   const c = await q('SELECT 1 FROM couriers WHERE phone=$1 AND active', [row.phone]);
   const role = row.role === 'admin' ? 'admin' : c.rowCount ? 'courier' : 'client';
-  return { id: row.id, phone: row.phone, name: row.name, role, lang: row.lang || 'fr' };
+  return { id: row.id, phone: row.phone, name: row.name, role, lang: row.lang || 'fr', email: row.email || '', preferred_payment: row.preferred_payment || 'cash' };
 }
-const courierOnly = (req, _res, next) => (req.user && req.user.role === 'courier' ? next() : next(httpErr(403, 'Réservé aux livreurs enregistrés.')));
+const courierOnly = (req, _res, next) => (req.user && (req.user.role === 'courier' || req.user.role === 'admin') ? next() : next(httpErr(403, 'Réservé aux livreurs enregistrés.', { code: 'err_courier_only' })));
 const adminOnly = (req, _res, next) => (req.user && req.user.role === 'admin' ? next() : next(httpErr(403, 'Réservé à la propriétaire.')));
 
 app.post('/auth/request-otp', otpLimiter, wrap(async (req, res) => {
   const phone = digits(req.body.phone);
-  if (phone.length < 8 || phone.length > 15) throw httpErr(400, 'Numéro de téléphone invalide.');
-  const prev = (await q('SELECT last_sent FROM otp_codes WHERE phone=$1', [phone])).rows[0];
-  if (prev && Date.now() - new Date(prev.last_sent).getTime() < 60 * 1000) {
-    throw httpErr(429, 'Patientez une minute avant de redemander un code.');
+  if (phone.length < 8 || phone.length > 15) {
+    throw httpErr(400, 'Numéro de téléphone invalide.', { code: 'err_phone_invalid' });
   }
+  const prev = (await q('SELECT last_sent FROM otp_codes WHERE phone=$1', [phone])).rows[0];
+  if (prev) {
+    const wait = 60 - Math.floor((Date.now() - new Date(prev.last_sent).getTime()) / 1000);
+    if (wait > 0) {
+      throw httpErr(429, 'Patientez avant de redemander un code.', { code: 'err_otp_wait', retry_after: wait });
+    }
+  }
+  const hourCount = (await q(
+    "SELECT COUNT(*)::int AS n FROM otp_requests WHERE phone=$1 AND requested_at > now() - interval '1 hour'",
+    [phone],
+  )).rows[0].n;
+  if (hourCount >= 5) {
+    throw httpErr(429, 'Trop de demandes de code. Réessayez dans une heure.', { code: 'err_otp_limit', retry_after: 3600 });
+  }
+  await q('INSERT INTO otp_requests (phone) VALUES ($1)', [phone]);
+
   const code = String(crypto.randomInt(100000, 1000000));
   await q(
     `INSERT INTO otp_codes (phone, code_hash, expires_at, tries, last_sent)
@@ -414,7 +460,6 @@ app.post('/auth/request-otp', otpLimiter, wrap(async (req, res) => {
      ON CONFLICT (phone) DO UPDATE SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at, tries = 0, last_sent = now()`,
     [phone, hashOtp(code)],
   );
-  // Format SMS Retriever Android : <#> … + empreinte 11 car. en dernière ligne
   const appHash = String(req.body.app_hash || '').trim();
   const withHash = /^[A-Za-z0-9+/=]{11}$/.test(appHash);
   const brand = env.SMS_BRAND || 'Patisserie';
@@ -422,8 +467,8 @@ app.post('/auth/request-otp', otpLimiter, wrap(async (req, res) => {
     ? `<#> ${brand}: code ${code}
 ${appHash}`
     : `${brand}: votre code est ${code}. Valide 5 min.`;
-  const smsResult = await sendSms(phone, text);
-  const payload = { ok: true };
+  const smsResult = await sendSms(phone, text.replace('\\n', '\n'));
+  const payload = { ok: true, retry_after: 60, expires_in: 300 };
   if (env.OTP_DEBUG === 'true') {
     payload.debug_code = code;
     payload.sms = smsResult || null;
@@ -436,23 +481,42 @@ app.post('/auth/verify-otp', otpLimiter, wrap(async (req, res) => {
   const phone = digits(req.body.phone);
   const code = String(req.body.code || '').trim();
   const o = (await q('SELECT * FROM otp_codes WHERE phone=$1', [phone])).rows[0];
-  if (!o || new Date(o.expires_at) < new Date()) throw httpErr(400, 'Code expiré : demandez-en un nouveau.');
-  if (o.tries >= 5) throw httpErr(429, 'Trop d’essais : demandez un nouveau code.');
+  if (!o || new Date(o.expires_at) < new Date()) {
+    throw httpErr(400, 'Code expiré : demandez-en un nouveau.', { code: 'err_otp_expired' });
+  }
+  if (o.tries >= 5) {
+    throw httpErr(429, 'Trop d’essais : demandez un nouveau code.', { code: 'err_otp_tries' });
+  }
   if (o.code_hash !== hashOtp(code)) {
     await q('UPDATE otp_codes SET tries = tries + 1 WHERE phone=$1', [phone]);
-    throw httpErr(400, 'Code incorrect.');
+    throw httpErr(400, 'Code incorrect.', { code: 'err_otp_wrong' });
   }
   await q('DELETE FROM otp_codes WHERE phone=$1', [phone]);
 
   const isAdmin = !!env.ADMIN_PHONE && digits(env.ADMIN_PHONE) === phone;
   const name = String(req.body.name || '').trim().slice(0, 60);
+  let email = String(req.body.email || '').trim().toLowerCase().slice(0, 120);
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw httpErr(400, 'Adresse e-mail invalide.', { code: 'err_email_invalid' });
+  }
+  if (!email) email = null;
+
+  if (email) {
+    const taken = (await q(
+      'SELECT id FROM users WHERE lower(email)=lower($1) AND phone <> $2 LIMIT 1',
+      [email, phone],
+    )).rows[0];
+    if (taken) throw httpErr(409, 'Cet e-mail est déjà utilisé.', { code: 'err_email_exists' });
+  }
+
   const user = (await q(
-    `INSERT INTO users (phone, name, role) VALUES ($1, $2, $3)
+    `INSERT INTO users (phone, name, role, email) VALUES ($1, $2, $3, $4)
      ON CONFLICT (phone) DO UPDATE SET
-       role = CASE WHEN $4::boolean THEN 'admin' ELSE users.role END,
-       name = CASE WHEN users.name = '' AND $2 <> '' THEN $2 ELSE users.name END
-     RETURNING id, phone, name, role, lang`,
-    [phone, name, isAdmin ? 'admin' : 'client', isAdmin],
+       role = CASE WHEN $5::boolean THEN 'admin' ELSE users.role END,
+       name = CASE WHEN users.name = '' AND $2 <> '' THEN $2 ELSE users.name END,
+       email = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE users.email END
+     RETURNING id, phone, name, role, lang, email`,
+    [phone, name, isAdmin ? 'admin' : 'client', email, isAdmin],
   )).rows[0];
   const lang = String(req.body.lang || '');
   if (LANGS.includes(lang) && lang !== user.lang) {
@@ -463,25 +527,123 @@ app.post('/auth/verify-otp', otpLimiter, wrap(async (req, res) => {
   res.json({ token, user: await publicUser(user) });
 }));
 
+
+// ── Inscription / connexion par mot de passe (3 profils) ─────────────────────
+const ROLES_PUBLIC = ['client', 'admin', 'courier'];
+
+app.post('/auth/register', otpLimiter, wrap(async (req, res) => {
+  const phone = digits(req.body.phone);
+  const name = String(req.body.name || '').trim().slice(0, 60);
+  const email = String(req.body.email || '').trim().toLowerCase().slice(0, 120);
+  const password = String(req.body.password || '');
+  const roleReq = String(req.body.role || 'client');
+  const preferredPayment = String(req.body.preferred_payment || 'cash');
+
+  if (phone.length < 8 || phone.length > 15) throw httpErr(400, 'Numéro de téléphone invalide.', { code: 'err_phone_invalid' });
+  if (!name) throw httpErr(400, 'Prénom requis.', { code: 'err_name_required' });
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw httpErr(400, 'Adresse e-mail invalide.', { code: 'err_email_invalid' });
+  if (password.length < 6) throw httpErr(400, 'Mot de passe trop court (6 caractères min.).', { code: 'err_password_min' });
+  if (!ROLES_PUBLIC.includes(roleReq)) throw httpErr(400, 'Rôle invalide.', { code: 'err_invalid_role' });
+
+  let role = 'client';
+  if (roleReq === 'admin') {
+    if (!env.ADMIN_PHONE || digits(env.ADMIN_PHONE) !== phone) {
+      throw httpErr(403, 'Ce numéro n’est pas autorisé comme responsable.', { code: 'err_admin_phone' });
+    }
+    role = 'admin';
+  } else if (roleReq === 'courier') {
+    const c = (await q('SELECT 1 FROM couriers WHERE phone=$1 AND active', [phone])).rows[0];
+    if (!c) throw httpErr(403, 'Ce numéro n’est pas enregistré comme livreur. Demandez à la responsable.', { code: 'err_courier_phone' });
+    role = 'courier';
+  }
+
+  const existing = (await q('SELECT id, password_hash FROM users WHERE phone=$1', [phone])).rows[0];
+  if (existing && existing.password_hash) {
+    throw httpErr(409, 'Un compte existe déjà avec ce numéro. Connectez-vous.', { code: 'err_phone_exists' });
+  }
+  const emailTaken = (await q(
+    'SELECT id FROM users WHERE lower(email)=lower($1) AND phone <> $2 LIMIT 1',
+    [email, phone],
+  )).rows[0];
+  if (emailTaken) throw httpErr(409, 'Cet e-mail est déjà utilisé.', { code: 'err_email_exists' });
+
+  const hash = await bcrypt.hash(password, 10);
+  const pay = ['cash', 'online', 'mobile_money', 'card'].includes(preferredPayment) ? preferredPayment : 'cash';
+
+  const user = (await q(
+    `INSERT INTO users (phone, name, role, email, password_hash, preferred_payment)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (phone) DO UPDATE SET
+       name = EXCLUDED.name,
+       role = EXCLUDED.role,
+       email = EXCLUDED.email,
+       password_hash = EXCLUDED.password_hash,
+       preferred_payment = EXCLUDED.preferred_payment
+     RETURNING id, phone, name, role, lang, email, preferred_payment`,
+    [phone, name, role, email, hash, pay],
+  )).rows[0];
+
+  const token = jwt.sign({ sub: user.id }, JWT_SECRET, { expiresIn: '90d' });
+  res.json({ token, user: await publicUser(user) });
+}));
+
+app.post('/auth/login', otpLimiter, wrap(async (req, res) => {
+  const login = String(req.body.login || req.body.phone || req.body.email || '').trim();
+  const password = String(req.body.password || '');
+  if (!login || password.length < 1) throw httpErr(400, 'Identifiant et mot de passe requis.', { code: 'err_login_fields' });
+
+  const phone = digits(login);
+  let row;
+  if (phone.length >= 8 && !login.includes('@')) {
+    row = (await q('SELECT * FROM users WHERE phone=$1', [phone])).rows[0];
+  } else {
+    row = (await q('SELECT * FROM users WHERE lower(email)=lower($1)', [login.toLowerCase()])).rows[0];
+  }
+  if (!row || !row.password_hash) {
+    throw httpErr(401, 'Identifiants incorrects.', { code: 'err_bad_credentials' });
+  }
+  const ok = await bcrypt.compare(password, row.password_hash);
+  if (!ok) throw httpErr(401, 'Identifiants incorrects.', { code: 'err_bad_credentials' });
+
+  const token = jwt.sign({ sub: row.id }, JWT_SECRET, { expiresIn: '90d' });
+  res.json({ token, user: await publicUser(row) });
+}));
+
 app.get('/me', auth, (req, res) => res.json(req.user));
 app.patch('/me', auth, wrap(async (req, res) => {
   const sets = [];
   const vals = [];
   if (req.body.name !== undefined) {
     const name = String(req.body.name || '').trim().slice(0, 60);
-    if (!name) throw httpErr(400, 'Prénom requis.');
+    if (!name) throw httpErr(400, 'Prénom requis.', { code: 'err_name_required' });
     vals.push(name);
     sets.push(`name=$${vals.length}`);
   }
+  if (req.body.email !== undefined) {
+    let email = String(req.body.email || '').trim().toLowerCase().slice(0, 120);
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw httpErr(400, 'Adresse e-mail invalide.', { code: 'err_email_invalid' });
+    }
+    if (!email) email = null;
+    if (email) {
+      const taken = (await q(
+        'SELECT id FROM users WHERE lower(email)=lower($1) AND id <> $2 LIMIT 1',
+        [email, req.user.id],
+      )).rows[0];
+      if (taken) throw httpErr(409, 'Cet e-mail est déjà utilisé.', { code: 'err_email_exists' });
+    }
+    vals.push(email);
+    sets.push(`email=$${vals.length}`);
+  }
   if (req.body.lang !== undefined) {
     const l = String(req.body.lang);
-    if (!LANGS.includes(l)) throw httpErr(400, 'Langue inconnue.');
+    if (!LANGS.includes(l)) throw httpErr(400, 'Langue inconnue.', { code: 'err_lang_unknown' });
     vals.push(l);
     sets.push(`lang=$${vals.length}`);
   }
-  if (!sets.length) throw httpErr(400, 'Rien à modifier.');
+  if (!sets.length) throw httpErr(400, 'Rien à modifier.', { code: 'err_nothing' });
   vals.push(req.user.id);
-  const { rows } = await q(`UPDATE users SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING id, phone, name, role, lang`, vals);
+  const { rows } = await q(`UPDATE users SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING id, phone, name, role, lang, email`, vals);
   res.json(await publicUser(rows[0]));
 }));
 
@@ -1117,6 +1279,31 @@ app.post('/courier/deliveries/:id/start', auth, courierOnly, wrap(async (req, re
   res.json(courierView(rows[0]));
 }));
 
+
+app.post('/courier/deliveries/:id/accept', auth, courierOnly, wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Livraison introuvable.');
+  const { rows } = await q(
+    `UPDATE orders SET courier_id=$2, assigned_at=COALESCE(assigned_at, now()), updated_at=now()
+     WHERE id=$1 AND type='delivery' AND status IN ('ready','out_for_delivery')
+       AND (courier_id IS NULL OR courier_id=$2)
+     RETURNING *`,
+    [req.params.id, req.user.id],
+  );
+  if (!rows[0]) throw httpErr(400, 'Course indisponible ou déjà prise.', { code: 'err_ride_unavailable' });
+  pushAdmins('a_courier_accepted', orderVars(rows[0]), { type: 'order', order_id: rows[0].id });
+  res.json(courierView(rows[0]));
+}));
+
+app.post('/courier/deliveries/:id/refuse', auth, courierOnly, wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Livraison introuvable.');
+  const o = (await q(`SELECT * FROM orders WHERE id=$1 AND courier_id=$2 AND status IN ('ready','out_for_delivery')`, [req.params.id, req.user.id])).rows[0];
+  if (!o) throw httpErr(404, 'Livraison introuvable.');
+  if (o.status === 'out_for_delivery') throw httpErr(400, 'Course déjà démarrée : terminez-la avec le code client.', { code: 'err_ride_started' });
+  await q(`UPDATE orders SET courier_id=NULL, assigned_at=NULL, updated_at=now() WHERE id=$1`, [o.id]);
+  pushAdmins('a_courier_refused', orderVars(o), { type: 'order', order_id: o.id });
+  res.json({ ok: true });
+}));
+
 app.post('/courier/location', auth, courierOnly, wrap(async (req, res) => {
   const lat = Number(req.body.lat);
   const lng = Number(req.body.lng);
@@ -1131,10 +1318,10 @@ app.post('/courier/deliveries/:id/complete', auth, courierOnly, wrap(async (req,
   if (!o) throw httpErr(404, 'Livraison introuvable.');
   // Le client donne son code de livraison au livreur : preuve que la remise a eu lieu (5 essais maximum)
   const tries = (await kvGet(`dcode:${o.id}`)) || 0;
-  if (tries >= 5) throw httpErr(429, 'Trop d’essais. Contactez la pâtisserie.');
+  if (tries >= 5) throw httpErr(429, 'Trop d’essais. Contactez la pâtisserie.', { code: 'err_code_tries' });
   if (String(req.body.code || '').trim() !== o.delivery_code) {
     await kvSet(`dcode:${o.id}`, tries + 1, 3600);
-    throw httpErr(400, 'Code de livraison incorrect : demandez-le au client.');
+    throw httpErr(400, 'Code de livraison incorrect : demandez-le au client.', { code: 'err_code_wrong' });
   }
   const lat = Number(req.body.lat);
   const lng = Number(req.body.lng);
@@ -1152,13 +1339,39 @@ app.post('/courier/deliveries/:id/complete', auth, courierOnly, wrap(async (req,
 app.get('/orders/:id/tracking', auth, wrap(async (req, res) => {
   if (!isUuid(req.params.id)) throw httpErr(404, 'Commande introuvable.');
   const o = (await q('SELECT * FROM orders WHERE id=$1', [req.params.id])).rows[0];
-  if (!o || (o.user_id !== req.user.id && req.user.role !== 'admin')) throw httpErr(404, 'Commande introuvable.');
-  const st = await getSettings();
-  const out = { status: o.status, delivery_lat: o.delivery_lat, delivery_lng: o.delivery_lng, shop_lat: st.shop_lat, shop_lng: st.shop_lng, courier: null, delivered_at: o.delivered_at };
-  if (o.courier_id) {
-    const u = (await q('SELECT name FROM users WHERE id=$1', [o.courier_id])).rows[0];
-    const pos = o.status === 'out_for_delivery' ? await kvGet(`courier:${o.courier_id}`) : null;
-    out.courier = { name: u ? String(u.name || '').split(' ')[0] : '', lat: pos ? pos.lat : null, lng: pos ? pos.lng : null, heading: pos ? pos.heading : 0, ts: pos ? pos.ts : null };
+  if (!o) throw httpErr(404, 'Commande introuvable.');
+  const isOwner = req.user.role === 'admin';
+  const isBuyer = o.user_id === req.user.id;
+  const isCourier = o.courier_id === req.user.id;
+  if (!isOwner && !isBuyer && !isCourier) throw httpErr(403, 'Accès refusé.');
+  const settings = (await q('SELECT shop_lat, shop_lng FROM shop_settings WHERE id=1')).rows[0] || {};
+  let pos = null;
+  if (o.courier_id) pos = await kvGet(`courier:${o.courier_id}`);
+  const out = {
+    order_id: o.id,
+    status: o.status,
+    shop_lat: settings.shop_lat != null ? Number(settings.shop_lat) : null,
+    shop_lng: settings.shop_lng != null ? Number(settings.shop_lng) : null,
+    dest_lat: o.delivery_lat != null ? Number(o.delivery_lat) : null,
+    dest_lng: o.delivery_lng != null ? Number(o.delivery_lng) : null,
+    courier_lat: pos ? Number(pos.lat) : null,
+    courier_lng: pos ? Number(pos.lng) : null,
+    courier_heading: pos ? Number(pos.heading) || 0 : 0,
+    courier_ts: pos ? pos.ts : null,
+    // Code de livraison UNIQUEMENT pour l'acheteur (anti-chantage livreur)
+    delivery_code: isBuyer && o.status !== 'completed' ? o.delivery_code : undefined,
+  };
+  // Distance / ETA temps réel
+  if (out.courier_lat != null && out.dest_lat != null) {
+    try {
+      const r = await roadRoute(out.courier_lat, out.courier_lng, out.dest_lat, out.dest_lng);
+      out.remaining_km = Math.round(r.km * 10) / 10;
+      out.remaining_min = Math.round(r.min);
+    } catch (_) {
+      const km = haversineKm(out.courier_lat, out.courier_lng, out.dest_lat, out.dest_lng);
+      out.remaining_km = Math.round(km * 10) / 10;
+      out.remaining_min = Math.round((km / 25) * 60);
+    }
   }
   res.json(out);
 }));
@@ -1270,13 +1483,17 @@ app.use((err, req, res, _next) => {
   }
   const status = err.status || 500;
   if (status >= 500) console.error(`[Erreur] ${req.method} ${req.originalUrl}`, err);
-  res.status(status).json({ error: status >= 500 && !err.status ? 'Erreur interne du serveur.' : err.message });
+  const body = { error: status >= 500 && !err.status ? 'Erreur interne du serveur.' : err.message };
+  if (err.code) body.code = err.code;
+  if (err.retry_after != null) body.retry_after = err.retry_after;
+  res.status(status).json(body);
 });
 
 // ── Démarrage ────────────────────────────────────────────────────────────────
 (async () => {
   try {
     await migrate();
+    await seedResponsable();
     await ensureBucket();
     app.listen(PORT, '0.0.0.0', () => console.log(`✅ API pâtisserie démarrée sur le port ${PORT}`));
   } catch (e) {
