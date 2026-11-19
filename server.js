@@ -261,21 +261,52 @@ async function sendSms(phone, text) {
   const key = env.VONAGE_API_KEY;
   const secret = env.VONAGE_API_SECRET;
   if (!key || !secret) {
-    if (IS_PROD) throw httpErr(503, 'Envoi de SMS non configuré sur le serveur (VONAGE_API_KEY / VONAGE_API_SECRET).');
+    if (IS_PROD && env.OTP_DEBUG !== 'true') {
+      throw httpErr(503, 'Envoi de SMS non configuré sur le serveur (VONAGE_API_KEY / VONAGE_API_SECRET).');
+    }
     console.log(`[SMS — mode développement] +${phone} : ${text}`);
-    return;
+    return { mode: 'dev' };
   }
-  const r = await fetch('https://rest.nexmo.com/sms/json', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: key, api_secret: secret, to: phone, from: env.VONAGE_FROM || 'Patisserie', text }),
-  });
-  const j = await r.json().catch(() => ({}));
-  const m = j && j.messages && j.messages[0];
-  if (!m || m.status !== '0') {
-    console.error('[SMS] échec :', m);
-    throw httpErr(502, 'Le SMS n’a pas pu être envoyé. Réessayez dans un instant.');
+  // Expéditeur : alpha-numérique (max 11) ou numéro. Certains pays (GH, TG…)
+  // rejettent les alpha non enregistrés → on retente avec le numéro Vonage si fourni.
+  const fromCandidates = [
+    env.VONAGE_FROM,
+    env.VONAGE_FROM_NUMBER,
+    'Patisserie',
+  ].filter(Boolean);
+
+  let lastErr = null;
+  for (const from of fromCandidates) {
+    try {
+      const r = await fetch('https://rest.nexmo.com/sms/json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: key,
+          api_secret: secret,
+          to: phone,
+          from: String(from).slice(0, 11),
+          text,
+          type: 'unicode',
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      const m = j && j.messages && j.messages[0];
+      if (m && m.status === '0') {
+        console.log(`[SMS] OK → +${phone} (from=${from}, id=${m['message-id'] || '?'})`);
+        return { mode: 'vonage', messageId: m['message-id'] };
+      }
+      lastErr = m || j;
+      console.error('[SMS] tentative échouée from=', from, m || j);
+    } catch (e) {
+      lastErr = { error: e.message };
+      console.error('[SMS] réseau', e.message);
+    }
   }
+  console.error('[SMS] échec final :', lastErr);
+  // En OTP_DEBUG on n'interrompt pas : le code reste utilisable via debug_code
+  if (env.OTP_DEBUG === 'true') return { mode: 'failed_debug', error: lastErr };
+  throw httpErr(502, 'Le SMS n’a pas pu être envoyé. Réessayez dans un instant.');
 }
 
 const SMS_TEXT = {
@@ -383,12 +414,22 @@ app.post('/auth/request-otp', otpLimiter, wrap(async (req, res) => {
      ON CONFLICT (phone) DO UPDATE SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at, tries = 0, last_sent = now()`,
     [phone, hashOtp(code)],
   );
-  // Remplissage automatique Android : « <#> … » + empreinte de l'application en fin de message
+  // Format SMS Retriever Android : <#> … + empreinte 11 car. en dernière ligne
   const appHash = String(req.body.app_hash || '').trim();
   const withHash = /^[A-Za-z0-9+/=]{11}$/.test(appHash);
-  const text = `${withHash ? '<#> ' : ''}${env.SMS_BRAND || 'Patisserie'}: votre code est ${code} (valide 5 min).${withHash ? `\n${appHash}` : ''}`;
-  await sendSms(phone, text);
-  res.json({ ok: true });
+  const brand = env.SMS_BRAND || 'Patisserie';
+  const text = withHash
+    ? `<#> ${brand}: code ${code}
+${appHash}`
+    : `${brand}: votre code est ${code}. Valide 5 min.`;
+  const smsResult = await sendSms(phone, text);
+  const payload = { ok: true };
+  if (env.OTP_DEBUG === 'true') {
+    payload.debug_code = code;
+    payload.sms = smsResult || null;
+    console.log(`[OTP_DEBUG] +${phone} code=${code}`);
+  }
+  res.json(payload);
 }));
 
 app.post('/auth/verify-otp', otpLimiter, wrap(async (req, res) => {
