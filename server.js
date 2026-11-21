@@ -20,6 +20,8 @@ const { createClient } = require('@supabase/supabase-js');
 const env = process.env;
 const PORT = Number(env.PORT) || 3000;
 const IS_PROD = env.NODE_ENV === 'production';
+/** Le mode test des codes SMS (debug_code) est IGNORÉ en production : il permettrait de se connecter au compte de n'importe qui. */
+const OTP_DEBUG = env.OTP_DEBUG === 'true' && !IS_PROD;
 const JWT_SECRET = env.JWT_SECRET || '';
 if (JWT_SECRET.length < 32) {
   console.error('❌ JWT_SECRET (32 caractères minimum) est obligatoire.');
@@ -35,7 +37,27 @@ const pool = new Pool({
   ssl: env.DB_SSL === 'false' ? false : { rejectUnauthorized: false },
   max: 8,
 });
-const q = (text, params) => pool.query(text, params);
+// ── Temps réel (SSE) : chaque écriture sur les tables suivies prévient les applis connectées.
+// Le message ne contient AUCUNE donnée : chaque appli recharge ce qu'elle a le droit de voir.
+const sseClients = new Set();
+const sseTimers = new Map();
+function emitChange(table) {
+  if (sseTimers.has(table)) return;
+  sseTimers.set(table, setTimeout(() => {
+    sseTimers.delete(table);
+    const msg = `event: change\ndata: ${JSON.stringify({ t: table, at: Date.now() })}\n\n`;
+    for (const c of sseClients) {
+      try { c.write(msg); } catch (_) { sseClients.delete(c); }
+    }
+  }, 120));
+}
+const MUTATES = /^\s*(?:insert\s+into|update|delete\s+from)\s+(orders|products|categories|shop_settings|couriers)\b/i;
+const q = async (text, params) => {
+  const r = await pool.query(text, params);
+  const m = typeof text === 'string' ? MUTATES.exec(text) : null;
+  if (m) emitChange(m[1].toLowerCase());
+  return r;
+};
 
 // ── Redis (Upstash) : cache du catalogue, positions des livreurs, météo. Repli en mémoire si indisponible.
 let redis = null;
@@ -87,12 +109,16 @@ const bool = (v, d = false) => (v === true || v === 'true' || v === '1' ? true :
 const hashOtp = (code) => crypto.createHash('sha256').update(`${code}:${JWT_SECRET}`).digest('hex');
 
 const LANGS = ['fr', 'en', 'es', 'pt', 'ar', 'zh', 'ee', 'ha', 'yo', 'kab'];
-const CURRENCIES = ['XOF', 'USD', 'EUR', 'GBP'];
+const CURRENCIES = ['XOF', 'XAF', 'GHS', 'NGN', 'GNF', 'USD', 'EUR', 'GBP', 'JPY', 'CNY', 'CAD', 'CHF', 'MAD'];
+/** Taux indicatifs (1 unité = X FCFA) : la propriétaire les corrige dans Réglages. */
+const DEFAULT_RATES = { XOF: 1, XAF: 1, GHS: 55, NGN: 0.4, GNF: 0.07, USD: 600, EUR: 655.957, GBP: 770, JPY: 4, CNY: 85, CAD: 440, CHF: 700, MAD: 60 };
 const num2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
 /** Convertit un prix (dans la devise du produit) en FCFA selon les taux de la propriétaire. */
 function toXof(amount, cur, s) {
-  const rate = cur === 'USD' ? Number(s.rate_usd) : cur === 'EUR' ? Number(s.rate_eur) : cur === 'GBP' ? Number(s.rate_gbp) : 1;
-  return Math.round((Number(amount) || 0) * (rate || 1));
+  const custom = s.rates && typeof s.rates === 'object' ? Number(s.rates[cur]) : NaN;
+  const legacy = cur === 'USD' ? Number(s.rate_usd) : cur === 'EUR' ? Number(s.rate_eur) : cur === 'GBP' ? Number(s.rate_gbp) : NaN;
+  const rate = [custom, legacy, DEFAULT_RATES[cur], 1].find((x) => Number.isFinite(x) && x > 0);
+  return Math.round((Number(amount) || 0) * rate);
 }
 const rad = (d) => (d * Math.PI) / 180;
 function haversineKm(lat1, lng1, lat2, lng2) {
@@ -122,8 +148,13 @@ async function deliveryInfo(settings, lat, lng) {
     km = Math.round(r.km * 100) / 100;
     min = Math.round(r.min);
   }
-  const raw = (settings.delivery_fee || 0) + (km != null ? km * (settings.delivery_per_km || 0) : 0);
-  return { km, min, fee: Math.round(raw / 5) * 5 };
+  // Formule horokilométrique : prix = prise en charge + distance × tarif/km + durée × tarif/min + frais fixes
+  const base = settings.delivery_fee || 0;
+  const distance = km != null ? km * (settings.delivery_per_km || 0) : 0;
+  const time = min != null ? min * (settings.delivery_per_min || 0) : 0;
+  const extra = settings.delivery_extra || 0;
+  const fee = Math.round((base + distance + time + extra) / 5) * 5;
+  return { km, min, fee, breakdown: { base, distance: Math.round(distance), time: Math.round(time), extra } };
 }
 
 const STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'out_for_delivery', 'completed', 'cancelled', 'quote_pending', 'quoted'];
@@ -248,6 +279,12 @@ async function migrate() {
     ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS shop_lng double precision;
     ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS delivery_per_km int NOT NULL DEFAULT 0;
     ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS delivery_max_km int NOT NULL DEFAULT 0;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS delivery_per_min int NOT NULL DEFAULT 0;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS delivery_extra int NOT NULL DEFAULT 0;
+    ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS rates jsonb NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS duration_min int;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_override boolean NOT NULL DEFAULT false;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_override_note text NOT NULL DEFAULT '';
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lat double precision;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lng double precision;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_code text NOT NULL DEFAULT '';
@@ -293,7 +330,7 @@ async function sendSms(phone, text) {
   const key = env.VONAGE_API_KEY;
   const secret = env.VONAGE_API_SECRET;
   if (!key || !secret) {
-    if (IS_PROD && env.OTP_DEBUG !== 'true') {
+    if (IS_PROD && !OTP_DEBUG) {
       throw httpErr(503, 'Envoi de SMS non configuré sur le serveur (VONAGE_API_KEY / VONAGE_API_SECRET).');
     }
     console.log(`[SMS — mode développement] +${phone} : ${text}`);
@@ -337,7 +374,7 @@ async function sendSms(phone, text) {
   }
   console.error('[SMS] échec final :', lastErr);
   // En OTP_DEBUG on n'interrompt pas : le code reste utilisable via debug_code
-  if (env.OTP_DEBUG === 'true') return { mode: 'failed_debug', error: lastErr };
+  if (OTP_DEBUG) return { mode: 'failed_debug', error: lastErr };
   throw httpErr(502, 'Le SMS n’a pas pu être envoyé. Réessayez dans un instant.');
 }
 
@@ -469,7 +506,7 @@ ${appHash}`
     : `${brand}: votre code est ${code}. Valide 5 min.`;
   const smsResult = await sendSms(phone, text.replace('\\n', '\n'));
   const payload = { ok: true, retry_after: 60, expires_in: 300 };
-  if (env.OTP_DEBUG === 'true') {
+  if (OTP_DEBUG) {
     payload.debug_code = code;
     payload.sms = smsResult || null;
     console.log(`[OTP_DEBUG] +${phone} code=${code}`);
@@ -555,6 +592,10 @@ app.post('/auth/register', otpLimiter, wrap(async (req, res) => {
     const c = (await q('SELECT 1 FROM couriers WHERE phone=$1 AND active', [phone])).rows[0];
     if (!c) throw httpErr(403, 'Ce numéro n’est pas enregistré comme livreur. Demandez à la responsable.', { code: 'err_courier_phone' });
     role = 'courier';
+  } else {
+    const reserved = (!!env.ADMIN_PHONE && digits(env.ADMIN_PHONE) === phone)
+      || (await q('SELECT 1 FROM couriers WHERE phone=$1 AND active', [phone])).rowCount > 0;
+    if (reserved) throw httpErr(403, 'Ce numéro correspond à un autre profil.', { code: 'err_role_mismatch' });
   }
 
   const existing = (await q('SELECT id, password_hash FROM users WHERE phone=$1', [phone])).rows[0];
@@ -605,8 +646,13 @@ app.post('/auth/login', otpLimiter, wrap(async (req, res) => {
   const ok = await bcrypt.compare(password, row.password_hash);
   if (!ok) throw httpErr(401, 'Identifiants incorrects.', { code: 'err_bad_credentials' });
 
+  const user = await publicUser(row);
+  const wanted = String(req.body.role || '');
+  if (wanted && user.role !== wanted) {
+    throw httpErr(403, 'Ce compte n’a pas ce profil.', { code: 'err_role_mismatch' });
+  }
   const token = jwt.sign({ sub: row.id }, JWT_SECRET, { expiresIn: '90d' });
-  res.json({ token, user: await publicUser(row) });
+  res.json({ token, user });
 }));
 
 app.get('/me', auth, (req, res) => res.json(req.user));
@@ -679,6 +725,9 @@ app.get('/settings', wrap(async (_req, res) => {
     const s = await getSettings();
     delete s.id;
     s.payment_providers = enabledProviders(); // ex. ['flutterwave','paystack'] (clés présentes sur le serveur)
+    const d = deliveryStatus(s);
+    s.delivery_available = d.ok;
+    s.delivery_reason = d.reason;
     return s;
   }));
 }));
@@ -699,20 +748,118 @@ app.get('/weather', wrap(async (_req, res) => {
   res.json(w);
 }));
 
-// Estimation de la livraison : distance par la route, durée, frais, zone
-app.post('/delivery/quote', auth, wrap(async (req, res) => {
+/** La livraison n'est proposée que si tout est prêt : position de la boutique, tarif, paiement en ligne.
+ *  Sinon un client irait jusqu'au bout pour rien, ou la livraison serait gratuite par erreur. */
+function deliveryStatus(st) {
+  const tariff = [st.delivery_fee, st.delivery_per_km, st.delivery_per_min, st.delivery_extra].some((v) => Number(v) > 0);
+  if (st.shop_lat == null || st.shop_lng == null) return { ok: false, reason: 'Livraison momentanément indisponible. Choisissez le retrait en boutique.' };
+  if (!tariff) return { ok: false, reason: 'Livraison momentanément indisponible. Choisissez le retrait en boutique.' };
+  if (!(st.online_payment && enabledProviders().length > 0 && (st.allow_card || st.allow_mobile_money))) {
+    return { ok: false, reason: 'Livraison momentanément indisponible (paiement en ligne non activé). Choisissez le retrait en boutique.' };
+  }
+  return { ok: true, reason: '' };
+}
+const RATE_EXEMPT = ['XOF', 'XAF', 'EUR']; // FCFA et euro sont liés à parité fixe : pas de taux à saisir
+async function assertRateKnown(currency) {
+  if (RATE_EXEMPT.includes(currency)) return;
+  const st = await getSettings();
+  const r = st.rates && Number(st.rates[currency]);
+  if (!(r > 0)) throw httpErr(400, `Définissez d’abord le taux de change ${currency} → FCFA dans Réglages.`, { code: 'err_rate_missing' });
+}
+
+// Estimation de la livraison : distance par la route, durée, frais, zone (public : le tarif n'a rien de secret)
+const geoLimiter = rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false });
+app.post('/delivery/quote', geoLimiter, wrap(async (req, res) => {
   const lat = Number(req.body.lat);
   const lng = Number(req.body.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw httpErr(400, 'Position invalide.');
   const st = await getSettings();
+  const avail = deliveryStatus(st);
+  if (!avail.ok) throw httpErr(409, avail.reason, { code: 'err_delivery_unavailable' });
   const info = await deliveryInfo(st, lat, lng);
   const within = !(st.delivery_max_km > 0 && info.km != null && info.km > st.delivery_max_km);
-  res.json({ distance_km: info.km, duration_min: info.min, fee: info.fee, max_km: st.delivery_max_km, within_zone: within });
+  res.json({ distance_km: info.km, duration_min: info.min, fee: info.fee, breakdown: info.breakdown, currency: 'XOF', max_km: st.delivery_max_km, within_zone: within });
 }));
 
+// Recherche d'adresse / lieu (Photon puis Nominatim : gratuit, sans clé) et adresse d'un point
+const GEO_UA = { 'User-Agent': `patisserie-app/1.0 (${env.GEO_CONTACT || 'contact@patisserie.app'})`, 'Accept-Language': 'fr,en' };
+const geoCache = new Map();
+const geoGet = (k) => { const h = geoCache.get(k); return h && Date.now() - h.at < 6 * 3600 * 1000 ? h.v : null; };
+const geoSet = (k, v) => { if (geoCache.size > 800) geoCache.delete(geoCache.keys().next().value); geoCache.set(k, { at: Date.now(), v }); return v; };
+async function fetchJson(url, ms = 7000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { headers: GEO_UA, signal: ctl.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } finally { clearTimeout(timer); }
+}
+const validCoord = (lat, lng) => lat !== undefined && lng !== undefined && lat !== '' && lng !== ''
+  && Number.isFinite(Number(lat)) && Number.isFinite(Number(lng)) && Math.abs(Number(lat)) <= 90 && Math.abs(Number(lng)) <= 180;
+
+app.get('/geo/search', geoLimiter, wrap(async (req, res) => {
+  const text = String(req.query.q || '').trim().slice(0, 120);
+  if (text.length < 3) return res.json([]);
+  const bias = validCoord(req.query.lat, req.query.lng) ? `&lat=${Number(req.query.lat)}&lon=${Number(req.query.lng)}` : '';
+  const key = `s:${text.toLowerCase()}:${bias ? Number(req.query.lat).toFixed(1) + Number(req.query.lng).toFixed(1) : ''}`;
+  const hit = geoGet(key);
+  if (hit) return res.json(hit);
+  let out = [];
+  try {
+    const j = await fetchJson(`https://photon.komoot.io/api/?q=${encodeURIComponent(text)}&limit=8${bias}`);
+    out = (j.features || []).map((f) => {
+      const p = f.properties || {};
+      const [lng, lat] = f.geometry.coordinates;
+      const label = [p.name, p.street && `${p.street}${p.housenumber ? ' ' + p.housenumber : ''}`, p.city || p.town || p.village, p.state, p.country]
+        .filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(', ');
+      return { label, lat, lng };
+    });
+  } catch (_) {
+    try {
+      const j = await fetchJson(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&q=${encodeURIComponent(text)}`);
+      out = (j || []).map((p) => ({ label: p.display_name, lat: Number(p.lat), lng: Number(p.lon) }));
+    } catch (_e) { throw httpErr(503, 'Recherche indisponible.'); }
+  }
+  res.json(geoSet(key, out));
+}));
+
+app.get('/geo/reverse', geoLimiter, wrap(async (req, res) => {
+  if (!validCoord(req.query.lat, req.query.lng)) throw httpErr(400, 'Position invalide.');
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  const key = `r:${lat.toFixed(4)}:${lng.toFixed(4)}`;
+  const hit = geoGet(key);
+  if (hit) return res.json(hit);
+  let label = '';
+  try {
+    const j = await fetchJson(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`);
+    label = String(j.display_name || '').split(',').slice(0, 3).join(',').trim();
+  } catch (_) { /* pas d'adresse : l'appli affichera les coordonnées */ }
+  res.json(geoSet(key, { label }));
+}));
+
+// Flux temps réel (public : il ne transporte aucune donnée, seulement « quelque chose a changé ») : l'appli reste connectée et se recharge dès qu'une commande, un produit ou un réglage change.
+app.get('/events', (req, res) => {
+  if (sseClients.size >= 2000) return res.status(503).end();
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write('retry: 3000\n\n: connecté\n\n');
+  sseClients.add(res);
+  const beat = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) { /* fermé */ } }, 20000);
+  req.on('close', () => { clearInterval(beat); sseClients.delete(res); });
+});
+
 // ── Commandes (client) ───────────────────────────────────────────────────────
-app.post('/orders', auth, wrap(async (req, res) => {
+const ordersLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'Trop de commandes en peu de temps. Réessayez plus tard.' } });
+app.post('/orders', auth, ordersLimiter, wrap(async (req, res) => {
   const b = req.body || {};
+  const pendingCount = (await q(`SELECT COUNT(*)::int AS n FROM orders WHERE user_id=$1 AND status IN ('pending','quote_pending') AND payment_status='unpaid' AND created_at > now() - interval '24 hours'`, [req.user.id])).rows[0].n;
+  if (pendingCount >= 5) throw httpErr(429, 'Vous avez déjà plusieurs commandes en attente. Payez ou annulez-en une avant d’en créer une nouvelle.');
   const type = b.type === 'delivery' ? 'delivery' : 'pickup';
   const address = String(b.address || '').trim().slice(0, 300);
   if (type === 'delivery' && address.length < 5) throw httpErr(400, 'Indiquez l’adresse de livraison.');
@@ -776,13 +923,21 @@ app.post('/orders', auth, wrap(async (req, res) => {
   }
   let fee = 0;
   let distanceKm = null;
+  let durationMin = null;
   if (type === 'delivery') {
+    const avail = deliveryStatus(settings);
+    if (!avail.ok) throw httpErr(409, avail.reason, { code: 'err_delivery_unavailable' });
     const info = await deliveryInfo(settings, dLat, dLng);
     distanceKm = info.km;
     if (settings.delivery_max_km > 0 && info.km != null && info.km > settings.delivery_max_km) {
       throw httpErr(400, `Hors zone de livraison (${settings.delivery_max_km} km maximum).`);
     }
     fee = info.fee;
+    durationMin = info.min;
+    // L'acheteur a accepté un tarif précis : s'il a changé entre-temps, il doit le revalider.
+    if (b.accepted_fee !== undefined && b.accepted_fee !== null && Number(b.accepted_fee) !== fee) {
+      throw httpErr(409, `Le tarif de livraison a changé (${fee} FCFA). Validez le nouveau tarif.`, { code: 'err_fee_changed' });
+    }
   }
   const total = isCustom ? 0 : subtotal + fee;
   const wantsOnline = b.payment_method === 'online' && settings.online_payment && !isCustom
@@ -797,11 +952,11 @@ app.post('/orders', auth, wrap(async (req, res) => {
   const deliveryCode = type === 'delivery' ? String(crypto.randomInt(1000, 10000)) : '';
 
   const { rows } = await q(
-    `INSERT INTO orders (user_id, customer_name, phone, type, address, scheduled_at, payment_method, payment_provider, payment_channel, status, total, delivery_fee, note, items, is_custom, custom_details, delivery_lat, delivery_lng, delivery_code, distance_km)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb,$17,$18,$19,$20) RETURNING *`,
+    `INSERT INTO orders (user_id, customer_name, phone, type, address, scheduled_at, payment_method, payment_provider, payment_channel, status, total, delivery_fee, note, items, is_custom, custom_details, delivery_lat, delivery_lng, delivery_code, distance_km, duration_min)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb,$17,$18,$19,$20,$21) RETURNING *`,
     [req.user.id, req.user.name || 'Client', req.user.phone, type, type === 'delivery' ? address : '', when.toISOString(),
       paymentMethod, paymentProvider, paymentChannel, status, total, isCustom ? 0 : fee, note, JSON.stringify(items), isCustom, JSON.stringify(customDetails),
-      dLat, dLng, deliveryCode, distanceKm],
+      dLat, dLng, deliveryCode, distanceKm, durationMin],
   );
   const created = rows[0];
   pushAdmins(isCustom ? 'a_custom' : 'a_new', orderVars(created), { type: 'order', order_id: created.id });
@@ -1138,6 +1293,7 @@ function parseProduct(body) {
 
 admin.post('/products', upload.single('image'), wrap(async (req, res) => {
   const p = parseProduct(req.body);
+  await assertRateKnown(p.currency);
   const image = req.file ? await storeImage(req.file.buffer, 'products') : null;
   const { rows } = await q(
     `INSERT INTO products (name, description, category_id, price, currency, sizes, image_url, emoji, is_available, is_featured, prep_hours)
@@ -1152,6 +1308,7 @@ admin.patch('/products/:id', upload.single('image'), wrap(async (req, res) => {
   const cur = (await q('SELECT image_url FROM products WHERE id=$1', [req.params.id])).rows[0];
   if (!cur) throw httpErr(404, 'Produit introuvable.');
   const p = parseProduct(req.body);
+  await assertRateKnown(p.currency);
   let image = cur.image_url;
   if (req.file) image = await storeImage(req.file.buffer, 'products');
   else if (bool(req.body.remove_image)) image = null;
@@ -1170,6 +1327,14 @@ admin.delete('/products/:id', wrap(async (req, res) => {
 }));
 
 // Réglages
+function cleanRates(input, prev) {
+  const out = { ...(prev && typeof prev === 'object' ? prev : {}) };
+  for (const c of CURRENCIES) {
+    const n = Number(input[c]);
+    if (Number.isFinite(n) && n > 0 && n < 1e9) out[c] = n;
+  }
+  return out;
+}
 admin.patch('/settings', wrap(async (req, res) => {
   const b = req.body || {};
   const cur = await getSettings();
@@ -1180,6 +1345,9 @@ admin.patch('/settings', wrap(async (req, res) => {
     is_open: b.is_open !== undefined ? bool(b.is_open, cur.is_open) : cur.is_open,
     delivery_fee: b.delivery_fee !== undefined ? Math.max(0, int(b.delivery_fee, cur.delivery_fee)) : cur.delivery_fee,
     delivery_per_km: b.delivery_per_km !== undefined ? Math.max(0, int(b.delivery_per_km, cur.delivery_per_km)) : cur.delivery_per_km,
+    delivery_per_min: b.delivery_per_min !== undefined ? Math.max(0, int(b.delivery_per_min, cur.delivery_per_min)) : cur.delivery_per_min,
+    delivery_extra: b.delivery_extra !== undefined ? Math.max(0, int(b.delivery_extra, cur.delivery_extra)) : cur.delivery_extra,
+    rates: b.rates && typeof b.rates === 'object' ? cleanRates(b.rates, cur.rates) : cur.rates,
     delivery_max_km: b.delivery_max_km !== undefined ? Math.max(0, int(b.delivery_max_km, cur.delivery_max_km)) : cur.delivery_max_km,
     min_lead_hours: b.min_lead_hours !== undefined ? Math.min(720, Math.max(0, int(b.min_lead_hours, cur.min_lead_hours))) : cur.min_lead_hours,
     online_payment: b.online_payment !== undefined ? bool(b.online_payment, cur.online_payment) : cur.online_payment,
@@ -1197,12 +1365,12 @@ admin.patch('/settings', wrap(async (req, res) => {
   await q(
     `UPDATE shop_settings SET shop_name=$1, is_open=$2, delivery_fee=$3, delivery_per_km=$4, delivery_max_km=$5, min_lead_hours=$6,
        online_payment=$7, allow_card=$8, allow_mobile_money=$9, rate_usd=$10, rate_eur=$11, rate_gbp=$12, shop_lat=$13, shop_lng=$14,
-       whatsapp=$15, opening_hours=$16, address=$17 WHERE id=1`,
+       whatsapp=$15, opening_hours=$16, address=$17, delivery_per_min=$18, delivery_extra=$19, rates=$20::jsonb WHERE id=1`,
     [next.shop_name, next.is_open, next.delivery_fee, next.delivery_per_km, next.delivery_max_km, next.min_lead_hours, next.online_payment,
       next.allow_card, next.allow_mobile_money, next.rate_usd, next.rate_eur, next.rate_gbp, next.shop_lat, next.shop_lng,
-      next.whatsapp, next.opening_hours, next.address],
+      next.whatsapp, next.opening_hours, next.address, next.delivery_per_min, next.delivery_extra, JSON.stringify(next.rates || {})],
   );
-  await kvDel('c:weather');
+  await kvDel('c:weather', 'c:settings');
   res.json(next);
 }));
 
@@ -1248,6 +1416,32 @@ admin.post('/orders/:id/assign', wrap(async (req, res) => {
   if (!c) throw httpErr(400, 'Livreur inconnu ou désactivé.');
   const { rows } = await q('UPDATE orders SET courier_id=$1, assigned_at=now(), updated_at=now() WHERE id=$2 RETURNING *', [c.id, o.id]);
   pushUser(c.id, 'courier_new', orderVars(rows[0]), { type: 'delivery', order_id: o.id });
+  res.json(rows[0]);
+}));
+// Code de livraison oublié : la responsable peut le renvoyer par SMS au client, ou valider la remise sans code.
+const deliveryOrder = async (id) => {
+  if (!isUuid(id)) throw httpErr(404, 'Commande introuvable.');
+  const o = (await q('SELECT * FROM orders WHERE id=$1', [id])).rows[0];
+  if (!o) throw httpErr(404, 'Commande introuvable.');
+  if (o.type !== 'delivery' || !['ready', 'out_for_delivery'].includes(o.status)) throw httpErr(400, 'Cette commande n’est pas en cours de livraison.');
+  return o;
+};
+admin.post('/orders/:id/delivery-code/sms', wrap(async (req, res) => {
+  const o = await deliveryOrder(req.params.id);
+  await sendSms(digits(o.phone), `Patisserie : votre code de livraison pour ${o.code} est ${o.delivery_code}. Donnez-le uniquement au livreur, à la remise.`);
+  await kvDel(`dcode:${o.id}`); // remet à zéro les essais du livreur
+  res.json({ ok: true });
+}));
+admin.post('/orders/:id/force-complete', wrap(async (req, res) => {
+  const o = await deliveryOrder(req.params.id);
+  if (o.status !== 'out_for_delivery') throw httpErr(400, 'La livraison doit être en route pour être validée sans code.');
+  if (o.payment_status !== 'paid') throw httpErr(400, 'Commande non payée : validation impossible.');
+  const reason = String((req.body && req.body.reason) || '').trim().slice(0, 300);
+  if (reason.length < 5) throw httpErr(400, 'Indiquez le motif (ex. : client joint par téléphone, code perdu).');
+  const { rows } = await q(`UPDATE orders SET status='completed', delivered_at=now(), delivery_override=true, delivery_override_note=$2, updated_at=now() WHERE id=$1 RETURNING *`, [o.id, reason]);
+  await kvDel(`dcode:${o.id}`);
+  console.log(`[Livraison] ${o.code} validée SANS code par la responsable. Motif : ${reason}`);
+  pushUser(o.user_id, 'delivered', orderVars(rows[0]), { type: 'order', order_id: o.id });
   res.json(rows[0]);
 }));
 app.use('/admin', admin);
@@ -1302,6 +1496,61 @@ app.post('/courier/deliveries/:id/refuse', auth, courierOnly, wrap(async (req, r
   await q(`UPDATE orders SET courier_id=NULL, assigned_at=NULL, updated_at=now() WHERE id=$1`, [o.id]);
   pushAdmins('a_courier_refused', orderVars(o), { type: 'order', order_id: o.id });
   res.json({ ok: true });
+}));
+
+// Navigation dans l'appli : itinéraire routier avec étapes (tracé + manœuvres traduites côté appli)
+async function navRoute(lat1, lng1, lat2, lng2) {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 9000);
+    const r = await fetch(`${OSRM}/route/v1/driving/${lng1},${lat1};${lng2},${lat2}?overview=full&geometries=geojson&steps=true&alternatives=false&continue_straight=true`, { signal: ctl.signal });
+    clearTimeout(timer);
+    const j = await r.json();
+    const rt = j.routes && j.routes[0];
+    if (j.code === 'Ok' && rt && rt.geometry && rt.geometry.coordinates.length) {
+      let pts = rt.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+      if (pts.length > 1500) {
+        const k = Math.ceil(pts.length / 1500);
+        pts = pts.filter((_, i) => i % k === 0 || i === pts.length - 1);
+      }
+      const steps = [];
+      for (const leg of rt.legs || []) {
+        for (const s of leg.steps || []) {
+          const loc = s.maneuver && s.maneuver.location;
+          steps.push({
+            type: (s.maneuver && s.maneuver.type) || '', modifier: (s.maneuver && s.maneuver.modifier) || '', name: s.name || '',
+            distance_m: Math.round(s.distance || 0), duration_s: Math.round(s.duration || 0),
+            lat: loc ? Number(loc[1]) : null, lng: loc ? Number(loc[0]) : null,
+          });
+        }
+      }
+      return { source: 'road', distance_km: Math.round(rt.distance / 100) / 10, duration_min: Math.max(1, Math.round(rt.duration / 60)), points: pts, steps };
+    }
+  } catch (_) { /* repli ligne droite */ }
+  const km = haversineKm(lat1, lng1, lat2, lng2) * 1.25;
+  return {
+    source: 'estimate', distance_km: Math.round(km * 10) / 10, duration_min: Math.max(1, Math.round((km / 30) * 60)),
+    points: [[lat1, lng1], [lat2, lng2]],
+    steps: [
+      { type: 'depart', modifier: '', name: '', distance_m: Math.round(km * 1000), duration_s: Math.round((km / 30) * 3600), lat: lat1, lng: lng1 },
+      { type: 'arrive', modifier: '', name: '', distance_m: 0, duration_s: 0, lat: lat2, lng: lng2 },
+    ],
+  };
+}
+const routeLimiter = rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false });
+app.post('/courier/deliveries/:id/route', auth, courierOnly, routeLimiter, wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Livraison introuvable.');
+  const o = (await q(`SELECT * FROM orders WHERE id=$1 AND courier_id=$2 AND status IN ('ready','out_for_delivery')`, [req.params.id, req.user.id])).rows[0];
+  if (!o || o.delivery_lat == null || o.delivery_lng == null) throw httpErr(404, 'Livraison introuvable.');
+  let lat = Number(req.body.lat);
+  let lng = Number(req.body.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+    const st = await getSettings();
+    if (st.shop_lat == null || st.shop_lng == null) throw httpErr(400, 'Position invalide.');
+    lat = Number(st.shop_lat);
+    lng = Number(st.shop_lng);
+  }
+  res.json(await navRoute(lat, lng, Number(o.delivery_lat), Number(o.delivery_lng)));
 }));
 
 app.post('/courier/location', auth, courierOnly, wrap(async (req, res) => {
@@ -1495,6 +1744,9 @@ app.use((err, req, res, _next) => {
     await migrate();
     await seedResponsable();
     await ensureBucket();
+    if (!env.ADMIN_PHONE) console.warn('⚠️  ADMIN_PHONE est vide : personne ne peut s’inscrire comme responsable.');
+    if (!enabledProviders().length) console.warn('⚠️  Aucune clé de paiement (Flutterwave/Paystack) : la livraison est désactivée tant que le paiement en ligne n’est pas configuré.');
+    if (env.OTP_DEBUG === 'true' && IS_PROD) console.warn('⚠️  OTP_DEBUG ignoré en production (sécurité).');
     app.listen(PORT, '0.0.0.0', () => console.log(`✅ API pâtisserie démarrée sur le port ${PORT}`));
   } catch (e) {
     console.error('❌ Démarrage impossible :', e.message);
