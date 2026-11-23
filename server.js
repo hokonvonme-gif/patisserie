@@ -429,7 +429,9 @@ app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '200kb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false }));
+const HOT_PATH = /^\/(courier\/location|events|orders\/[^/]+\/(tracking|route))$/;
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1500, standardHeaders: true, legacyHeaders: false, skip: (req) => HOT_PATH.test(req.path) }));
+app.use(rateLimit({ windowMs: 60 * 1000, max: 90, standardHeaders: true, legacyHeaders: false, skip: (req) => !HOT_PATH.test(req.path) })); // position/suivi toutes les 2 s
 const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -728,6 +730,7 @@ app.get('/settings', wrap(async (_req, res) => {
     const d = deliveryStatus(s);
     s.delivery_available = d.ok;
     s.delivery_reason = d.reason;
+    s.traffic_tiles_url = env.TOMTOM_API_KEY ? `https://api.tomtom.com/traffic/map/4/tile/flow/relative/{z}/{x}/{y}.png?tileSize=256&key=${env.TOMTOM_API_KEY}` : '';
     return s;
   }));
 }));
@@ -1498,44 +1501,109 @@ app.post('/courier/deliveries/:id/refuse', auth, courierOnly, wrap(async (req, r
   res.json({ ok: true });
 }));
 
-// Navigation dans l'appli : itinéraire routier avec étapes (tracé + manœuvres traduites côté appli)
-async function navRoute(lat1, lng1, lat2, lng2) {
-  try {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 9000);
-    const r = await fetch(`${OSRM}/route/v1/driving/${lng1},${lat1};${lng2},${lat2}?overview=full&geometries=geojson&steps=true&alternatives=false&continue_straight=true`, { signal: ctl.signal });
-    clearTimeout(timer);
-    const j = await r.json();
-    const rt = j.routes && j.routes[0];
-    if (j.code === 'Ok' && rt && rt.geometry && rt.geometry.coordinates.length) {
-      let pts = rt.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-      if (pts.length > 1500) {
-        const k = Math.ceil(pts.length / 1500);
-        pts = pts.filter((_, i) => i % k === 0 || i === pts.length - 1);
-      }
-      const steps = [];
-      for (const leg of rt.legs || []) {
-        for (const s of leg.steps || []) {
-          const loc = s.maneuver && s.maneuver.location;
-          steps.push({
-            type: (s.maneuver && s.maneuver.type) || '', modifier: (s.maneuver && s.maneuver.modifier) || '', name: s.name || '',
-            distance_m: Math.round(s.distance || 0), duration_s: Math.round(s.duration || 0),
-            lat: loc ? Number(loc[1]) : null, lng: loc ? Number(loc[0]) : null,
-          });
-        }
-      }
-      return { source: 'road', distance_km: Math.round(rt.distance / 100) / 10, duration_min: Math.max(1, Math.round(rt.duration / 60)), points: pts, steps };
+// ── Navigation : itinéraire avec TRAFIC EN TEMPS RÉEL ─────────────────────────
+// Ordre d'essai : Mapbox driving-traffic (MAPBOX_TOKEN, 100 % gratuit grâce au plafond mensuel) → OSRM (sans trafic) → ligne droite.
+// Chaque réponse : { source, traffic, distance_km, duration_min (avec trafic), typical_min (sans trafic),
+//                    points:[[lat,lng]], congestion:[0..4 par segment], steps:[…] }   0 inconnu · 1 fluide · 2 ralenti · 3 dense · 4 bloqué
+const CONGESTION = { low: 1, moderate: 2, heavy: 3, severe: 4 };
+
+function downsampleRoute(points, levels, max = 1500) {
+  if (points.length <= max) return { points, levels };
+  const k = Math.ceil(points.length / max);
+  const p2 = [];
+  const l2 = [];
+  for (let i = 0; i < points.length; i += k) {
+    p2.push(points[i]);
+    let worst = 0;
+    for (let j = i; j < Math.min(i + k, levels.length); j++) worst = Math.max(worst, levels[j] || 0);
+    l2.push(worst);
+  }
+  if (p2[p2.length - 1] !== points[points.length - 1]) p2.push(points[points.length - 1]);
+  while (l2.length > p2.length - 1) l2.pop();
+  while (l2.length < p2.length - 1) l2.push(0);
+  return { points: p2, levels: l2 };
+}
+
+function osrmStyleSteps(legs) {
+  const steps = [];
+  for (const leg of legs || []) {
+    for (const s of leg.steps || []) {
+      const loc = s.maneuver && s.maneuver.location;
+      steps.push({
+        type: (s.maneuver && s.maneuver.type) || '', modifier: (s.maneuver && s.maneuver.modifier) || '', name: s.name || '',
+        distance_m: Math.round(s.distance || 0), duration_s: Math.round(s.duration || 0),
+        lat: loc ? Number(loc[1]) : null, lng: loc ? Number(loc[0]) : null,
+      });
     }
-  } catch (_) { /* repli ligne droite */ }
+  }
+  return steps;
+}
+
+async function osrmRoute(lat1, lng1, lat2, lng2) {
+  const j = await fetchJson(`${OSRM}/route/v1/driving/${lng1},${lat1};${lng2},${lat2}?overview=full&geometries=geojson&steps=true&alternatives=false&continue_straight=true`, 9000);
+  const rt = j.routes && j.routes[0];
+  if (j.code !== 'Ok' || !rt || !rt.geometry || !rt.geometry.coordinates.length) return null;
+  const d = downsampleRoute(rt.geometry.coordinates.map(([lng, lat]) => [lat, lng]), []);
+  const min = Math.max(1, Math.round(rt.duration / 60));
+  return { source: 'osrm', traffic: false, distance_km: Math.round(rt.distance / 100) / 10, duration_min: min, typical_min: min, points: d.points, congestion: [], steps: osrmStyleSteps(rt.legs) };
+}
+
+/** Garde-fou « 100 % gratuit » : au-delà du plafond mensuel (MAPBOX_MONTHLY_LIMIT, 90 000 par défaut sur 100 000 gratuits),
+ *  on n'appelle plus Mapbox jusqu'au mois suivant et l'itinéraire repasse sur OSRM (sans trafic). */
+async function mapboxQuotaOk() {
+  const limit = Number(env.MAPBOX_MONTHLY_LIMIT) || 90000;
+  const key = `mbx:${new Date().toISOString().slice(0, 7)}`;
+  const n = Number(await kvGet(key)) || 0;
+  if (n >= limit) return false;
+  await kvSet(key, n + 1, 35 * 24 * 3600);
+  return true;
+}
+
+async function mapboxRoute(lat1, lng1, lat2, lng2) {
+  if (!(await mapboxQuotaOk())) return null;
+  const url = `https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${lng1},${lat1};${lng2},${lat2}?alternatives=false&geometries=geojson&overview=full&steps=true&annotations=congestion&access_token=${encodeURIComponent(env.MAPBOX_TOKEN)}`;
+  const j = await fetchJson(url, 9000);
+  const rt = j.routes && j.routes[0];
+  if (!rt || !rt.geometry || !rt.geometry.coordinates.length) return null;
+  const leg = (rt.legs && rt.legs[0]) || {};
+  const cong = ((leg.annotation && leg.annotation.congestion) || []).map((c) => CONGESTION[c] || 0);
+  const d = downsampleRoute(rt.geometry.coordinates.map(([lng, lat]) => [lat, lng]), cong);
+  const min = Math.max(1, Math.round(rt.duration / 60));
+  const typical = rt.duration_typical ? Math.max(1, Math.round(rt.duration_typical / 60)) : min;
+  return { source: 'mapbox', traffic: true, distance_km: Math.round(rt.distance / 100) / 10, duration_min: min, typical_min: typical, points: d.points, congestion: d.levels, steps: osrmStyleSteps(rt.legs) };
+}
+
+async function navRoute(lat1, lng1, lat2, lng2) {
+  // Mapbox (gratuit dans la limite du quota mensuel) puis OpenStreetMap/OSRM (gratuit, sans trafic)
+  const providers = [];
+  if (env.MAPBOX_TOKEN) providers.push(['mapbox', mapboxRoute]);
+  providers.push(['osrm', osrmRoute]);
+  for (const [name, fn] of providers) {
+    try {
+      const r = await fn(lat1, lng1, lat2, lng2);
+      if (r) return r;
+    } catch (e) { console.warn(`[Itinéraire] ${name} indisponible : ${e.message}`); }
+  }
   const km = haversineKm(lat1, lng1, lat2, lng2) * 1.25;
+  const min = Math.max(1, Math.round((km / 30) * 60));
   return {
-    source: 'estimate', distance_km: Math.round(km * 10) / 10, duration_min: Math.max(1, Math.round((km / 30) * 60)),
-    points: [[lat1, lng1], [lat2, lng2]],
+    source: 'estimate', traffic: false, distance_km: Math.round(km * 10) / 10, duration_min: min, typical_min: min,
+    points: [[lat1, lng1], [lat2, lng2]], congestion: [],
     steps: [
       { type: 'depart', modifier: '', name: '', distance_m: Math.round(km * 1000), duration_s: Math.round((km / 30) * 3600), lat: lat1, lng: lng1 },
       { type: 'arrive', modifier: '', name: '', distance_m: 0, duration_s: 0, lat: lat2, lng: lng2 },
     ],
   };
+}
+const routeCache = new Map(); // commande -> { at, data }
+async function cachedNavRoute(orderId, lat1, lng1, lat2, lng2) {
+  const hit = routeCache.get(orderId);
+  const ttl = env.MAPBOX_TOKEN ? 30000 : 10000; // moins d'appels Mapbox : on reste dans le quota gratuit
+  if (hit && Date.now() - hit.at < ttl) return hit.data;
+  const data = await navRoute(lat1, lng1, lat2, lng2);
+  routeCache.set(orderId, { at: Date.now(), data });
+  if (routeCache.size > 300) routeCache.delete(routeCache.keys().next().value);
+  return data;
 }
 const routeLimiter = rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false });
 app.post('/courier/deliveries/:id/route', auth, courierOnly, routeLimiter, wrap(async (req, res) => {
@@ -1558,6 +1626,7 @@ app.post('/courier/location', auth, courierOnly, wrap(async (req, res) => {
   const lng = Number(req.body.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw httpErr(400, 'Position invalide.');
   await kvSet(`courier:${req.user.id}`, { lat, lng, speed: Number(req.body.speed) || 0, heading: Number(req.body.heading) || 0, ts: Date.now() }, 180);
+  emitChange('courier'); // les acheteurs qui suivent rechargent la position tout de suite
   res.json({ ok: true });
 }));
 
@@ -1585,6 +1654,18 @@ app.post('/courier/deliveries/:id/complete', auth, courierOnly, wrap(async (req,
 }));
 
 // Suivi en direct (client propriétaire de la commande, ou propriétaire de la boutique)
+app.get('/orders/:id/route', auth, routeLimiter, wrap(async (req, res) => {
+  if (!isUuid(req.params.id)) throw httpErr(404, 'Commande introuvable.');
+  const o = (await q('SELECT * FROM orders WHERE id=$1', [req.params.id])).rows[0];
+  if (!o) throw httpErr(404, 'Commande introuvable.');
+  if (req.user.role !== 'admin' && o.user_id !== req.user.id && o.courier_id !== req.user.id) throw httpErr(403, 'Accès refusé.');
+  if (o.status !== 'out_for_delivery' || !o.courier_id || o.delivery_lat == null || o.delivery_lng == null) return res.json({ points: [] });
+  const pos = await kvGet(`courier:${o.courier_id}`);
+  if (!pos) return res.json({ points: [] });
+  const r = await cachedNavRoute(o.id, Number(pos.lat), Number(pos.lng), Number(o.delivery_lat), Number(o.delivery_lng));
+  res.json({ points: r.points, congestion: r.congestion, traffic: r.traffic, distance_km: r.distance_km, duration_min: r.duration_min, typical_min: r.typical_min, source: r.source });
+}));
+
 app.get('/orders/:id/tracking', auth, wrap(async (req, res) => {
   if (!isUuid(req.params.id)) throw httpErr(404, 'Commande introuvable.');
   const o = (await q('SELECT * FROM orders WHERE id=$1', [req.params.id])).rows[0];
@@ -1613,9 +1694,11 @@ app.get('/orders/:id/tracking', auth, wrap(async (req, res) => {
   // Distance / ETA temps réel
   if (out.courier_lat != null && out.dest_lat != null) {
     try {
-      const r = await roadRoute(out.courier_lat, out.courier_lng, out.dest_lat, out.dest_lng);
-      out.remaining_km = Math.round(r.km * 10) / 10;
-      out.remaining_min = Math.round(r.min);
+      const r = await cachedNavRoute(o.id, out.courier_lat, out.courier_lng, out.dest_lat, out.dest_lng);
+      out.remaining_km = r.distance_km;
+      out.remaining_min = r.duration_min;
+      out.traffic = r.traffic;
+      out.traffic_delay_min = r.traffic ? Math.max(0, r.duration_min - (r.typical_min || r.duration_min)) : 0;
     } catch (_) {
       const km = haversineKm(out.courier_lat, out.courier_lng, out.dest_lat, out.dest_lng);
       out.remaining_km = Math.round(km * 10) / 10;
